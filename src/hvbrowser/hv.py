@@ -5,12 +5,24 @@ from typing import Any
 from hbrowser.gallery import EHDriver
 from hbrowser.gallery.utils import setup_logger
 
+from .lottery import (
+    LotteryClient,
+    LotteryKind,
+    LotteryPurchaseReport,
+    LotterySnapshot,
+)
 from .market import (
     MarketCategory,
     MarketClient,
     MarketSalePlan,
     MarketSaleReport,
     MarketSnapshot,
+)
+from .monster_lab import (
+    MonsterLabClient,
+    MonsterLabFeed,
+    MonsterLabFeedReport,
+    MonsterLabSnapshot,
 )
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
@@ -99,57 +111,48 @@ class HVDriver(EHDriver):
         """Submit a previously reviewed sale plan."""
         return await MarketClient(self).submit_sales(plan)
 
+    async def inspect_lottery(self, kind: LotteryKind) -> LotterySnapshot:
+        """Return a read-only snapshot for one explicit lottery."""
+        return await LotteryClient(self).inspect(kind)
+
+    async def purchase_lottery_tickets(
+        self,
+        kind: LotteryKind,
+        amount: int,
+        *,
+        expected_before: LotterySnapshot | None = None,
+    ) -> LotteryPurchaseReport:
+        """Purchase and verify one explicit lottery ticket quantity."""
+        return await LotteryClient(self).purchase(
+            kind,
+            amount,
+            expected_before=expected_before,
+        )
+
     async def loetterycheck(self, num: int) -> None:
+        """Compatibility wrapper that replenishes both lotteries in order."""
         logger.info(f"Checking lottery tickets (target: {num})")
-        await self.gohomepage()
-
-        for lettory in ["Weapon Lottery", "Armor Lottery"]:
-            logger.debug(f"Processing {lettory}")
-            bazaar = await self.page.select("#parent_Bazaar")
-            lettory_xpath = f"//div[contains(text(), '{lettory}')]"
-            lettory_elements = await self.page.xpath(lettory_xpath, timeout=5)
-            if not lettory_elements:
-                continue
-            lettory_elem = lettory_elements[0]
-
-            # Hover bazaar then click lottery
-            await bazaar.mouse_move()
-            await lettory_elem.mouse_move()
-            await lettory_elem.mouse_click()
-            await self.page.wait(1)
-
-            currently_elements = await self.page.xpath(
-                "//*[contains(text(), 'You currently have')]", timeout=5
+        if not isinstance(num, int) or isinstance(num, bool) or num < 0:
+            raise ValueError("Lottery target must be a non-negative integer")
+        client = LotteryClient(self)
+        for kind in LotteryKind:
+            snapshot = await client.inspect(kind)
+            deficit = max(0, num - snapshot.tickets)
+            purchase_amount = min(
+                deficit, snapshot.gp_balance // snapshot.ticket_price_gp
             )
-            if not currently_elements:
-                continue
-            numbers: list[str] = re.findall(r"[\d,]+", currently_elements[0].text)
-            currently_number = numbers[0].replace(",", "")
-
-            hold_elements = await self.page.xpath(
-                "//*[contains(text(), 'You hold')]", timeout=5
-            )
-            if not hold_elements:
-                continue
-            numbers = re.findall(r"[\d,]+", hold_elements[0].text)
-            buy_number = numbers[0].replace(",", "")
-
-            logger.info(
-                f"{lettory}: Currently have {currently_number} credits, "
-                f"hold {buy_number} tickets"
-            )
-
-            if int(buy_number) < num and int(currently_number) > (num * 1000):
-                purchase_amount = num - int(buy_number)
-                logger.info(f"Purchasing {purchase_amount} tickets for {lettory}")
-                html_element = await self.page.select("#ticket_temp")
-                await html_element.clear_input()
-                await html_element.send_keys(str(purchase_amount))
-                await self.page.evaluate("submit_buy()")
-            else:
-                logger.debug(
-                    f"No purchase needed for {lettory} "
-                    f"(tickets: {buy_number}, credits: {currently_number})"
+            if purchase_amount:
+                await client.purchase(
+                    kind,
+                    purchase_amount,
+                    expected_before=snapshot,
+                )
+            elif deficit:
+                logger.info(
+                    "Insufficient GP to replenish %s (holding %d of %d)",
+                    kind.value,
+                    snapshot.tickets,
+                    num,
                 )
 
     async def get_stamina(self) -> int:
@@ -354,38 +357,20 @@ class HVDriver(EHDriver):
         logger.info("Repaired equipment")
         return True
 
+    async def inspect_monster_lab(self) -> MonsterLabSnapshot:
+        """Return read-only availability for both Monster Lab feed-all actions."""
+        return await MonsterLabClient(self).inspect()
+
+    async def feed_all_monsters(self, resource: MonsterLabFeed) -> MonsterLabFeedReport:
+        """Perform and verify one explicit Monster Lab feed-all action."""
+        return await MonsterLabClient(self).feed_all(resource)
+
     async def monstercheck(self) -> None:
+        """Compatibility wrapper that applies food and then drugs when needed."""
         logger.info("Starting monster check")
-        await self.gohomepage()
-
-        # 進入 Monster Lab
-        logger.debug("Navigating to Monster Lab")
-        bazaar = await self.page.select("#parent_Bazaar")
-        monster_lab_elements = await self.page.xpath(
-            "//div[contains(text(), 'Monster Lab')]", timeout=5
-        )
-        if not monster_lab_elements:
-            return
-        monster_lab = monster_lab_elements[0]
-
-        await bazaar.mouse_move()
-        await monster_lab.mouse_move()
-        await monster_lab.mouse_click()
-        await self.page.wait(1)
-
-        path_prefix = await self._get_path_prefix()
-        feed_actions = {"feed": "food", "drug": "drugs"}
-        for action, resource in feed_actions.items():
-            xpath = self.searchxpath(
-                [f"{path_prefix}/y/monster/{action}allmonsters.png"]
-            )
-            images = await self.page.xpath(xpath, timeout=2)
-            if images:
-                logger.info("Feeding all monsters with %s", resource)
-                await self.page.evaluate(f"do_feed_all('{resource}')")
-                await self.page.wait(10)
-            else:
-                logger.debug("No feed all option available for %s", resource)
+        client = MonsterLabClient(self)
+        for resource in MonsterLabFeed:
+            await client.feed_all(resource)
 
     async def marketcheck(
         self, sellitems: SellItems, *, commit: bool = False

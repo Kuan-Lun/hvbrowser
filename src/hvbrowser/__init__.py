@@ -11,12 +11,36 @@ __all__ = [
     "MarketSaleReport",
     "MarketSnapshot",
     "MarketSubmissionError",
+    "LotteryClient",
+    "LotteryKind",
+    "LotteryPageError",
+    "LotteryPurchaseReport",
+    "LotterySnapshot",
+    "LotteryStateChangedError",
+    "LotterySubmissionError",
+    "LOTTERY_TICKET_PRICE_GP",
+    "MonsterLabClient",
+    "MonsterLabFeed",
+    "MonsterLabFeedReport",
+    "MonsterLabPageError",
+    "MonsterLabSnapshot",
+    "MonsterLabSubmissionError",
     "HENTAIVERSE_ISEKAI_ROOT_URL",
     "HENTAIVERSE_ROOT_URL",
 ]
 
 
 from .hv import HVDriver, SellItems
+from .lottery import (
+    LOTTERY_TICKET_PRICE_GP,
+    LotteryClient,
+    LotteryKind,
+    LotteryPageError,
+    LotteryPurchaseReport,
+    LotterySnapshot,
+    LotteryStateChangedError,
+    LotterySubmissionError,
+)
 from .market import (
     MarketCategory,
     MarketClient,
@@ -28,5 +52,13 @@ from .market import (
     MarketSaleReport,
     MarketSnapshot,
     MarketSubmissionError,
+)
+from .monster_lab import (
+    MonsterLabClient,
+    MonsterLabFeed,
+    MonsterLabFeedReport,
+    MonsterLabPageError,
+    MonsterLabSnapshot,
+    MonsterLabSubmissionError,
 )
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL

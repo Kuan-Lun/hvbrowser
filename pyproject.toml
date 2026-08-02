@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hvbrowser"
-version = "0.1.1"
+version = "0.1.2"
 description = "Browser automation APIs for HentaiVerse."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -40,7 +40,14 @@ Tracker = "https://github.com/Kuan-Lun/hvbrowser/issues"
 packages = ["src/hvbrowser"]
 
 [tool.hatch.build.targets.sdist]
-include = ["/LICENSE", "/README.md", "/pyproject.toml", "/src", "/tests"]
+include = [
+    "/LICENSE",
+    "/README.md",
+    "/pyproject.toml",
+    "/scripts/live_readonly_smoke.py",
+    "/src",
+    "/tests",
+]
 
 [tool.ruff]
 line-length = 88
