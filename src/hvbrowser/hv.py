@@ -1,6 +1,7 @@
 import re
 from abc import ABC
 from typing import Any
+from urllib.parse import urlsplit
 
 from hbrowser.gallery import EHDriver
 from hbrowser.gallery.utils import setup_logger
@@ -27,6 +28,28 @@ from .monster_lab import (
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
+
+
+def _is_isekai_url(url: object) -> bool:
+    if not isinstance(url, str):
+        raise RuntimeError("Unable to determine realm from the current URL")
+
+    parsed = urlsplit(url)
+    expected = urlsplit(HENTAIVERSE_ROOT_URL)
+    try:
+        matches_origin = (
+            parsed.scheme.casefold() == expected.scheme
+            and parsed.hostname == expected.hostname
+            and (parsed.port or 443) == (expected.port or 443)
+            and parsed.username is None
+            and parsed.password is None
+        )
+    except ValueError as error:
+        raise RuntimeError("Unable to determine realm from the current URL") from error
+    if not matches_origin:
+        raise RuntimeError("Unable to determine realm outside HentaiVerse")
+
+    return parsed.path == "/isekai" or parsed.path.startswith("/isekai/")
 
 
 def genxpath(imagepath: str) -> str:
@@ -81,7 +104,7 @@ class HVDriver(EHDriver):
     @property
     async def is_isekai(self) -> bool:
         url = await self.page.evaluate("window.location.href")
-        return "isekai" in url
+        return _is_isekai_url(url)
 
     async def _get_path_prefix(self) -> str:
         return "/isekai" if await self.is_isekai else ""
