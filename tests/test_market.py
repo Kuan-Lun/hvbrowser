@@ -342,6 +342,16 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
                 MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
             )
 
+    async def test_submit_rejects_blank_stock_confirmation(self) -> None:
+        driver = _FakeDriver({})
+        driver.page.stock_after_submit = ""
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
+
+        with self.assertRaisesRegex(MarketSubmissionError, "confirmation is blank"):
+            await self._submit_with_verified_live_semantics(
+                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+            )
+
     async def test_submit_rejects_stale_plan_before_click(self) -> None:
         driver = _FakeDriver({})
         driver.page.stock_control.text = "14"

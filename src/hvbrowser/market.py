@@ -308,7 +308,17 @@ class MarketClient:
             raise MarketSubmissionError(
                 f"Market stock confirmation is missing for {item.name!r}"
             ) from error
-        return parse_market_stock(stock_control.text)
+        stock_text = stock_control.text
+        if not stock_text.strip():
+            raise MarketSubmissionError(
+                f"Market stock confirmation is blank for {item.name!r}"
+            )
+        try:
+            return parse_market_stock(stock_text)
+        except MarketPageError as error:
+            raise MarketSubmissionError(
+                f"Market stock confirmation is invalid for {item.name!r}"
+            ) from error
 
     async def _raise_for_submission_error(self, item: MarketItem) -> None:
         try:
