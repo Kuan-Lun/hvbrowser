@@ -1,0 +1,353 @@
+import re
+from collections.abc import Collection, Mapping
+from dataclasses import dataclass
+from enum import StrEnum
+from typing import Any, Protocol
+
+from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
+
+MARKET_ROOT_URL = f"{HENTAIVERSE_ROOT_URL}/"
+ISEKAI_MARKET_ROOT_URL = HENTAIVERSE_ISEKAI_ROOT_URL
+
+
+class MarketCategory(StrEnum):
+    CONSUMABLES = "co"
+    MATERIALS = "ma"
+    TROPHIES = "tr"
+    ARTIFACTS = "ar"
+    FIGURES = "fi"
+    MONSTER_ITEMS = "mo"
+
+
+_CATEGORY_LABELS: dict[MarketCategory, str] = {
+    MarketCategory.CONSUMABLES: "Consumables",
+    MarketCategory.MATERIALS: "Materials",
+    MarketCategory.TROPHIES: "Trophies",
+    MarketCategory.ARTIFACTS: "Artifacts",
+    MarketCategory.FIGURES: "Figures",
+    MarketCategory.MONSTER_ITEMS: "Monster Items",
+}
+
+PERSISTENT_MARKET_CATEGORIES = tuple(MarketCategory)
+ISEKAI_MARKET_CATEGORIES = (
+    MarketCategory.CONSUMABLES,
+    MarketCategory.MATERIALS,
+    MarketCategory.TROPHIES,
+)
+
+# The selectors and stock-confirmation path are covered offline, but the live
+# meaning of the selected sell-side quote has not yet been confirmed against
+# the current authenticated Market DOM.  Keep every public submission entry
+# point fail-closed until that read-only verification has happened.
+_MARKET_SUBMISSION_VERIFIED = False
+
+
+@dataclass(frozen=True)
+class MarketItem:
+    category: MarketCategory
+    item_id: int
+    name: str
+    stock: int
+
+
+@dataclass(frozen=True)
+class MarketSnapshot:
+    is_isekai: bool
+    items: tuple[MarketItem, ...]
+
+    def items_in(self, category: MarketCategory) -> tuple[MarketItem, ...]:
+        return tuple(item for item in self.items if item.category is category)
+
+
+@dataclass(frozen=True)
+class MarketSalePlan:
+    """A read-only snapshot of inventory selected for sale."""
+
+    is_isekai: bool
+    items: tuple[MarketItem, ...]
+
+    @property
+    def total_units(self) -> int:
+        return sum(item.stock for item in self.items)
+
+
+@dataclass(frozen=True)
+class MarketSaleQuote:
+    """Read-only pricing evidence from the first visible sell-side order."""
+
+    item: MarketItem
+    sell_order_id: int
+    order_text: str
+    current_stock: int
+
+
+@dataclass(frozen=True)
+class MarketSale:
+    item: MarketItem
+    remaining_stock: int
+
+
+@dataclass(frozen=True)
+class MarketSaleReport:
+    is_isekai: bool
+    sales: tuple[MarketSale, ...]
+
+
+class MarketPageError(RuntimeError):
+    """The Market page did not expose the expected read-only structure."""
+
+
+class MarketSubmissionError(RuntimeError):
+    """The Market rejected a sale or did not confirm the inventory change."""
+
+
+class _MarketDriver(Protocol):
+    page: Any
+
+    async def get(self, url: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class _SaleForm:
+    sell_order_id: int
+    order_text: str
+    current_stock: int
+    stock_control: Any
+    update_button: Any
+
+
+def market_browse_url(category: MarketCategory, *, is_isekai: bool) -> str:
+    if is_isekai and category not in ISEKAI_MARKET_CATEGORIES:
+        raise ValueError(f"{market_category_label(category)} is unavailable in Isekai")
+    root = ISEKAI_MARKET_ROOT_URL if is_isekai else MARKET_ROOT_URL
+    return f"{root}?s=Bazaar&ss=mk&screen=browseitems&filter={category.value}"
+
+
+def market_item_url(category: MarketCategory, item_id: int, *, is_isekai: bool) -> str:
+    return f"{market_browse_url(category, is_isekai=is_isekai)}&itemid={item_id}"
+
+
+def market_category_label(category: MarketCategory) -> str:
+    return _CATEGORY_LABELS[category]
+
+
+def parse_market_item_id(onclick: str) -> int:
+    patterns = (
+        r"[?&]itemid=(\d+)",
+        r"\bitemid\D+(\d+)",
+        r"\bselect_market_item\(\s*(\d+)\s*\)",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, onclick)
+        if match:
+            return int(match.group(1))
+    raise MarketPageError(
+        f"Unable to parse Market item id from row action: {onclick!r}"
+    )
+
+
+def parse_market_stock(text: str) -> int:
+    normalized = text.strip().replace(",", "")
+    if not normalized:
+        return 0
+    match = re.search(r"\d+", normalized)
+    if not match:
+        raise MarketPageError(f"Unable to parse Market stock value: {text!r}")
+    return int(match.group(0))
+
+
+def parse_market_sell_order_id(onclick: str) -> int:
+    match = re.search(
+        r"\bautofill_from_sell_order\(\s*(\d+)\s*,\s*0\s*,\s*0\s*\)",
+        onclick,
+    )
+    if not match:
+        raise MarketPageError(
+            f"Unable to parse Market sell-order id from action: {onclick!r}"
+        )
+    return int(match.group(1))
+
+
+class MarketClient:
+    """Market inspection, explicit sale planning, and verified submission."""
+
+    def __init__(self, driver: _MarketDriver) -> None:
+        self._driver = driver
+
+    async def inspect(self, *, is_isekai: bool) -> MarketSnapshot:
+        categories = (
+            ISEKAI_MARKET_CATEGORIES if is_isekai else PERSISTENT_MARKET_CATEGORIES
+        )
+        items: list[MarketItem] = []
+        for category in categories:
+            items.extend(await self._inspect_category(category, is_isekai=is_isekai))
+        return MarketSnapshot(is_isekai=is_isekai, items=tuple(items))
+
+    async def plan_sales(
+        self,
+        requested_names: Mapping[MarketCategory, Collection[str]],
+        *,
+        is_isekai: bool,
+    ) -> MarketSalePlan:
+        """Select stocked inventory without changing Market state."""
+        snapshot = await self.inspect(is_isekai=is_isekai)
+        normalized_requests = {
+            category: {name.casefold() for name in names}
+            for category, names in requested_names.items()
+        }
+        selected = tuple(
+            item
+            for item in snapshot.items
+            if item.stock > 0
+            and item.name.casefold() in normalized_requests.get(item.category, set())
+        )
+        return MarketSalePlan(is_isekai=is_isekai, items=selected)
+
+    async def validate_sale_forms(self, plan: MarketSalePlan) -> None:
+        """Verify every planned item form without clicking or submitting it."""
+        for item in plan.items:
+            await self.inspect_sale_quote(item, is_isekai=plan.is_isekai)
+
+    async def inspect_sale_quote(
+        self, item: MarketItem, *, is_isekai: bool
+    ) -> MarketSaleQuote:
+        """Inspect the current sell-side pricing source without clicking it."""
+        sale_form = await self._open_sale_form(item, is_isekai=is_isekai)
+        return MarketSaleQuote(
+            item=item,
+            sell_order_id=sale_form.sell_order_id,
+            order_text=sale_form.order_text,
+            current_stock=sale_form.current_stock,
+        )
+
+    async def submit_sales(self, plan: MarketSalePlan) -> MarketSaleReport:
+        """Submit an explicitly prepared plan and verify each stock change.
+
+        This operation never deposits credits and never touches existing sell
+        orders that are not present in ``plan``.
+        """
+        if not _MARKET_SUBMISSION_VERIFIED:
+            raise MarketSubmissionError(
+                "Market submission is disabled until the current live quote "
+                "and pricing semantics have been verified read-only"
+            )
+
+        return await self._submit_verified_sales(plan)
+
+    async def _submit_verified_sales(self, plan: MarketSalePlan) -> MarketSaleReport:
+        """Execute the guarded submission algorithm after live verification."""
+        sales: list[MarketSale] = []
+        for item in plan.items:
+            sale_form = await self._open_sale_form(item, is_isekai=plan.is_isekai)
+            if sale_form.current_stock != item.stock:
+                raise MarketSubmissionError(
+                    f"Market sale plan is stale for {item.name!r}: "
+                    f"planned={item.stock}, current={sale_form.current_stock}"
+                )
+            await self._driver.page.evaluate(
+                f"autofill_from_sell_order({sale_form.sell_order_id},0,0);"
+            )
+            await sale_form.stock_control.click()
+            await sale_form.update_button.click()
+            await self._driver.page.wait(1)
+            await self._raise_for_submission_error(item)
+
+            remaining_stock = await self._read_item_stock(
+                item, is_isekai=plan.is_isekai
+            )
+            if remaining_stock != 0:
+                raise MarketSubmissionError(
+                    f"Market did not sell all planned stock for {item.name!r}: "
+                    f"before={item.stock}, after={remaining_stock}"
+                )
+            sales.append(MarketSale(item=item, remaining_stock=remaining_stock))
+        return MarketSaleReport(is_isekai=plan.is_isekai, sales=tuple(sales))
+
+    async def _open_sale_form(self, item: MarketItem, *, is_isekai: bool) -> _SaleForm:
+        await self._driver.get(
+            market_item_url(item.category, item.item_id, is_isekai=is_isekai)
+        )
+        try:
+            sell_order_cells = await self._driver.page.xpath(
+                "//*[@id='market_itemsell']"
+                "//td[contains(@onclick, 'autofill_from_sell_order')]",
+                timeout=5,
+            )
+            stock_control = await self._driver.page.select(
+                "#sell_order_stock_field > span", timeout=5
+            )
+            update_button = await self._driver.page.select(
+                "#sellorder_update", timeout=5
+            )
+        except TimeoutError as error:
+            raise MarketPageError(
+                f"Market sale form is missing for {item.name!r}"
+            ) from error
+        if not sell_order_cells:
+            raise MarketPageError(
+                f"Market has no existing sell order to price {item.name!r}"
+            )
+        onclick = str(sell_order_cells[0].attrs.get("onclick", ""))
+        return _SaleForm(
+            sell_order_id=parse_market_sell_order_id(onclick),
+            order_text=sell_order_cells[0].text.strip(),
+            current_stock=parse_market_stock(stock_control.text),
+            stock_control=stock_control,
+            update_button=update_button,
+        )
+
+    async def _read_item_stock(self, item: MarketItem, *, is_isekai: bool) -> int:
+        await self._driver.get(
+            market_item_url(item.category, item.item_id, is_isekai=is_isekai)
+        )
+        try:
+            stock_control = await self._driver.page.select(
+                "#sell_order_stock_field > span", timeout=5
+            )
+        except TimeoutError as error:
+            raise MarketSubmissionError(
+                f"Market stock confirmation is missing for {item.name!r}"
+            ) from error
+        return parse_market_stock(stock_control.text)
+
+    async def _raise_for_submission_error(self, item: MarketItem) -> None:
+        try:
+            error_message = await self._driver.page.select(
+                "#messagebox_inner p.messagebox_error", timeout=1
+            )
+        except TimeoutError:
+            return
+        message = error_message.text.strip() or "unknown Market error"
+        raise MarketSubmissionError(f"Market rejected {item.name!r}: {message}")
+
+    async def _inspect_category(
+        self, category: MarketCategory, *, is_isekai: bool
+    ) -> list[MarketItem]:
+        await self._driver.get(market_browse_url(category, is_isekai=is_isekai))
+        try:
+            item_list = await self._driver.page.select("#market_itemlist", timeout=5)
+        except TimeoutError as error:
+            raise MarketPageError(
+                f"Market item list is missing for {market_category_label(category)}"
+            ) from error
+
+        rows = await item_list.query_selector_all("table > tbody > tr[onclick]")
+        items: list[MarketItem] = []
+        for row in rows:
+            cells = await row.query_selector_all("td")
+            if len(cells) < 2:
+                raise MarketPageError(
+                    f"Market row has fewer than two cells in "
+                    f"{market_category_label(category)}"
+                )
+            name = cells[0].text.strip()
+            onclick = str(row.attrs.get("onclick", ""))
+            items.append(
+                MarketItem(
+                    category=category,
+                    item_id=parse_market_item_id(onclick),
+                    name=name,
+                    stock=parse_market_stock(cells[1].text),
+                )
+            )
+        return items
