@@ -8,6 +8,10 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+from .maintenance_navigation import (
+    MaintenanceNavigationBlockedError,
+    select_bazaar_for_maintenance,
+)
 from .runtime import setup_logger
 
 logger = setup_logger(__name__)
@@ -144,13 +148,12 @@ class MonsterLabClient:
         ) from last_error
 
     async def _navigate(self) -> None:
-        await self.driver.gohomepage(force=True)
         try:
-            bazaar = await self.page.select("#parent_Bazaar")
+            bazaar = await select_bazaar_for_maintenance(self.driver)
+        except MaintenanceNavigationBlockedError:
+            raise
         except Exception as error:
             raise MonsterLabPageError("Bazaar menu is missing") from error
-        if bazaar is None:
-            raise MonsterLabPageError("Bazaar menu is missing")
         try:
             elements = await self.page.xpath(
                 "//div[contains(text(), 'Monster Lab')]", timeout=5

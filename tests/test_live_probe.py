@@ -30,9 +30,15 @@ class _FakePage:
 
 
 class _FakeDriver:
-    def __init__(self, *, in_battle: bool = False) -> None:
+    def __init__(
+        self,
+        *,
+        in_battle: bool = False,
+        is_isekai: bool = False,
+    ) -> None:
         self.page = _FakePage(in_battle=in_battle)
         self.get_stamina = AsyncMock(return_value=83)
+        self._is_isekai = is_isekai
         self.exited = False
 
     async def __aenter__(self) -> _FakeDriver:
@@ -43,7 +49,7 @@ class _FakeDriver:
 
     @property
     async def is_isekai(self) -> bool:
-        return False
+        return self._is_isekai
 
 
 class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
@@ -195,6 +201,29 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(result.quote)
         self.assertEqual(len(result.lotteries), 2)
         self.assertTrue(result.monster_lab and result.monster_lab.food_available)
+
+    async def test_isekai_probe_skips_persistent_only_services(self) -> None:
+        driver = _FakeDriver(is_isekai=True)
+
+        with (
+            patch("hvbrowser.live_probe.MarketClient") as market_type,
+            patch("hvbrowser.live_probe.LotteryClient") as lottery_type,
+            patch("hvbrowser.live_probe.MonsterLabClient") as monster_lab_type,
+        ):
+            result = await run_live_probe(
+                inspect_market=False,
+                inspect_lotteries=True,
+                inspect_monster_lab=True,
+                driver_factory=lambda: driver,
+                environment=_CREDENTIAL_ENV,
+            )
+
+        self.assertTrue(result.is_isekai)
+        self.assertEqual(result.lotteries, ())
+        self.assertIsNone(result.monster_lab)
+        market_type.assert_not_called()
+        lottery_type.assert_not_called()
+        monster_lab_type.assert_not_called()
 
     def test_probe_source_contains_no_mutating_browser_calls(self) -> None:
         repository = Path(__file__).parents[1]

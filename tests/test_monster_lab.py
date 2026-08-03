@@ -13,6 +13,15 @@ from hvbrowser import (
 )
 
 
+def _maintenance_markers() -> dict[str, bool]:
+    return {
+        "challenge": False,
+        "completion": False,
+        "nextFloor": False,
+        "active": False,
+    }
+
+
 async def _no_sleep(_seconds: float) -> None:
     return
 
@@ -65,8 +74,10 @@ class _FakeMonsterLabPage:
                 return [_FakeElement()] if resource in self.available else []
         raise AssertionError(f"Unexpected XPath: {selector}, {timeout}")
 
-    async def evaluate(self, expression: str) -> bool:
+    async def evaluate(self, expression: str) -> object:
         self.evaluated.append(expression)
+        if "riddlesubmit" in expression and "finishbattle.png" in expression:
+            return _maintenance_markers()
         if expression == "typeof do_feed_all === 'function'":
             return self.has_api
         if self.submission_error is not None:
@@ -121,7 +132,9 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.menu_entry.mouse_move_count, 1)
         self.assertEqual(page.menu_entry.mouse_click_count, 1)
         self.assertEqual(page.waited, [1])
-        self.assertEqual(page.evaluated, ["typeof do_feed_all === 'function'"])
+        self.assertEqual(len(page.evaluated), 2)
+        self.assertIn("riddlesubmit", page.evaluated[0])
+        self.assertEqual(page.evaluated[1], "typeof do_feed_all === 'function'")
 
     async def test_inspect_fails_closed_when_page_api_is_missing(self) -> None:
         page = _FakeMonsterLabPage()

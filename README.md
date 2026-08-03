@@ -5,6 +5,9 @@ HVBrowser provides browser automation APIs for HentaiVerse. It builds on
 
 The package was extracted from the historical combined `hbrowser`
 distribution. Battle-domain APIs live in the separate `hvbattle` package.
+HVBrowser 0.1.4 requires `hbrowser>=0.35.2,<0.36`; version 0.35.2 is the
+minimum release that provides the optional process-log API used when the
+calling application has no external output supervisor.
 
 ## Lottery and Monster Lab APIs
 
@@ -51,6 +54,23 @@ check and a separately authorized mutation check, respectively. Missing page
 structure, unknown submission outcomes, and unstable/failed post-submit
 confirmation raise typed errors. Both purchase and feed-all calls change
 account state; automated package tests use only offline fakes.
+
+Lottery, Monster Lab, and Repair navigation share a fail-closed maintenance
+guard. One atomic DOM snapshot classifies timed challenge, final-completion,
+next-floor, and active-battle markers. Any such marker raises
+`MaintenanceNavigationBlockedError` before Bazaar interaction; its typed
+`blocker` field is a `MaintenanceNavigationBlocker` value. A Persistent
+post-battle client is allowed one initial navigation away from its own
+positively completed battle; the landing page is classified before any Bazaar
+interaction. Every retry and Repair navigation classifies the current page
+first, and every navigation is classified again after it completes.
+
+When no battle marker is present, a Bazaar selector timeout or missing element
+allows exactly one same-realm homepage retry. A second miss fails, and
+non-timeout errors are never retried. No Lottery purchase or Monster Lab
+submission is attempted during this navigation recovery. Repair captures the
+current realm before its fallback and reloads only that realm: Isekai uses
+`goisekai()`, while Persistent uses `gohomepage(force=True)`.
 
 ## Development
 
@@ -114,4 +134,5 @@ uv run --no-sync python scripts/live_readonly_smoke.py \
 `--skip-market` lets the two new selectors be checked independently while the
 Market integration is unavailable. The last two flags only inspect counts and
 action availability. They never call the Lottery purchase form or
-`do_feed_all`.
+`do_feed_all`. When the current realm is Isekai, Lottery and Monster Lab are
+reported as unavailable and skipped without navigating to Persistent.

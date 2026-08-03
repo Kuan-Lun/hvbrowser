@@ -96,7 +96,7 @@ async def run_live_probe(
         is_isekai = await driver.is_isekai
 
         lottery_summaries: tuple[LotterySummary, ...] = ()
-        if inspect_lotteries:
+        if inspect_lotteries and not is_isekai:
             lottery_client = LotteryClient(driver)
             lottery_summaries = tuple(
                 LotterySummary(
@@ -111,7 +111,7 @@ async def run_live_probe(
             )
 
         monster_lab_summary: MonsterLabSummary | None = None
-        if inspect_monster_lab:
+        if inspect_monster_lab and not is_isekai:
             monster_snapshot = await MonsterLabClient(driver).inspect()
             monster_lab_summary = MonsterLabSummary(
                 food_available=(

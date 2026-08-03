@@ -12,6 +12,7 @@ from .lottery import (
     LotteryPurchaseReport,
     LotterySnapshot,
 )
+from .maintenance_navigation import select_bazaar_with_safe_retry
 from .market import (
     MarketCategory,
     MarketClient,
@@ -274,15 +275,19 @@ class HVDriver(EHDriver):
 
     async def _goto_repair_tab(self) -> bool:
         """導航到 Bazaar -> The Armory -> Repair 頁籤。成功回傳 True。"""
-        try:
-            bazaar = await self.page.select("#parent_Bazaar")
-        except TimeoutError:
-            logger.warning(
-                "Timed out waiting for #parent_Bazaar; homepage may not have "
-                "finished loading yet, reloading and retrying once"
-            )
-            await self.gohomepage(force=True)
-            bazaar = await self.page.select("#parent_Bazaar")
+        is_isekai = await self.is_isekai
+
+        async def reload_current_realm() -> None:
+            if is_isekai:
+                await self.goisekai()
+            else:
+                await self.gohomepage(force=True)
+
+        bazaar = await select_bazaar_with_safe_retry(
+            self,
+            navigate_home=reload_current_realm,
+            navigate_first=False,
+        )
         armory_elements = await self.page.xpath(
             "//div[contains(text(), 'The Armory')]", timeout=5
         )
