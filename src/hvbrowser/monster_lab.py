@@ -121,7 +121,9 @@ class MonsterLabClient:
         last_snapshot: MonsterLabSnapshot | None = None
         last_error: Exception | None = None
         consecutive_absences = 0
-        for _ in range(self.confirmation_checks):
+        confirmation_error_count = 0
+        last_confirmation_error_type: str | None = None
+        for check in range(self.confirmation_checks):
             try:
                 await self._sleep(self.confirmation_interval)
             except Exception as error:
@@ -133,12 +135,25 @@ class MonsterLabClient:
             except Exception as error:
                 last_error = error
                 consecutive_absences = 0
+                confirmation_error_count += 1
+                last_confirmation_error_type = type(error).__name__
                 continue
             last_error = None
             if resource not in last_snapshot.available_feed_all:
                 consecutive_absences += 1
                 if consecutive_absences >= 2:
-                    logger.info("Fed all eligible monsters with %s", resource.value)
+                    if confirmation_error_count:
+                        logger.warning(
+                            "Monster Lab feed-all confirmation recovered after read "
+                            "errors: resource=%s confirmed_attempt=%d/%d "
+                            "error_count=%d last_error_type=%s",
+                            resource.value,
+                            check + 1,
+                            self.confirmation_checks,
+                            confirmation_error_count,
+                            last_confirmation_error_type,
+                        )
+                    logger.debug("Fed all eligible monsters with %s", resource.value)
                     return MonsterLabFeedReport(resource, True, before, last_snapshot)
             else:
                 consecutive_absences = 0

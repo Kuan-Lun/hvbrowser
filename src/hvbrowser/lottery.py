@@ -166,6 +166,8 @@ class LotteryClient:
         expected_gp = before.gp_balance - cost
         last_snapshot: LotterySnapshot | None = None
         last_error: Exception | None = None
+        confirmation_error_count = 0
+        last_confirmation_error_type: str | None = None
         for check in range(self.confirmation_checks):
             if check:
                 await asyncio.sleep(self.confirmation_interval)
@@ -173,6 +175,8 @@ class LotteryClient:
                 last_snapshot = await self._inspect_current(kind)
             except Exception as error:
                 last_error = error
+                confirmation_error_count += 1
+                last_confirmation_error_type = type(error).__name__
                 continue
             last_error = None
             if (
@@ -180,7 +184,18 @@ class LotteryClient:
                 and last_snapshot.gp_balance == expected_gp
             ):
                 report = LotteryPurchaseReport(before, amount, last_snapshot)
-                logger.info(
+                if confirmation_error_count:
+                    logger.warning(
+                        "Lottery purchase confirmation recovered after read errors: "
+                        "kind=%s confirmed_attempt=%d/%d error_count=%d "
+                        "last_error_type=%s",
+                        kind.value,
+                        check + 1,
+                        self.confirmation_checks,
+                        confirmation_error_count,
+                        last_confirmation_error_type,
+                    )
+                logger.debug(
                     "Purchased %d %s tickets for %d GP",
                     amount,
                     kind.value,

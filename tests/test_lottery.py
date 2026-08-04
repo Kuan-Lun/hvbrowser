@@ -208,15 +208,19 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=after
         )
 
-        report = await client.purchase(
-            LotteryKind.WEAPON,
-            800,
-            expected_before=before,
-        )
+        with self.assertLogs("hvbrowser.lottery", level="DEBUG") as captured:
+            report = await client.purchase(
+                LotteryKind.WEAPON,
+                800,
+                expected_before=before,
+            )
 
         self.assertEqual(report.purchased, 800)
         self.assertEqual(report.spent_gp, 800_000)
         self.assertEqual(report.after, after)
+        self.assertEqual(len(captured.output), 1)
+        self.assertTrue(captured.output[0].startswith("DEBUG:hvbrowser.lottery:"))
+        self.assertIn("Purchased 800 Weapon Lottery tickets", captured.output[0])
         ticket_input.send_keys.assert_awaited_once_with("800")
         self.assertEqual(
             page.evaluate.await_args_list,
@@ -225,6 +229,46 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 unittest.mock.call("submit_buy()"),
             ],
         )
+
+    async def test_purchase_warns_once_after_confirmation_read_recovers(
+        self,
+    ) -> None:
+        ticket_input = SimpleNamespace(
+            clear_input=AsyncMock(),
+            send_keys=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            select=AsyncMock(return_value=ticket_input),
+            evaluate=AsyncMock(side_effect=[True, None]),
+        )
+        client = LotteryClient(  # type: ignore[arg-type]
+            SimpleNamespace(page=page),
+            confirmation_checks=2,
+            confirmation_interval=0,
+        )
+        before = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
+        after = LotterySnapshot(LotteryKind.WEAPON, 800_000, 1_000)
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
+        client._inspect_current = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                LotteryPageError("private detail\nsecond line"),
+                after,
+            ]
+        )
+
+        with self.assertLogs("hvbrowser.lottery", level="WARNING") as captured:
+            report = await client.purchase(
+                LotteryKind.WEAPON,
+                800,
+                expected_before=before,
+            )
+
+        self.assertEqual(report.after, after)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("confirmed_attempt=2/2", captured.output[0])
+        self.assertIn("error_count=1", captured.output[0])
+        self.assertIn("last_error_type=LotteryPageError", captured.output[0])
+        self.assertNotIn("private detail", captured.output[0])
 
     async def test_purchase_rejects_unconfirmed_result(self) -> None:
         ticket_input = SimpleNamespace(
@@ -261,9 +305,31 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             purchase=AsyncMock(),
         )
 
-        with patch("hvbrowser.hv.LotteryClient", return_value=client):
+        with (
+            patch("hvbrowser.hv.LotteryClient", return_value=client),
+            patch("hvbrowser.hv.logger.debug") as debug,
+            patch("hvbrowser.hv.logger.info") as info,
+        ):
             await HVDriver.loetterycheck(driver, 1_000)
 
+        debug.assert_called_once_with("Checking lottery tickets: target=%d", 1_000)
+        self.assertEqual(
+            info.call_args_list,
+            [
+                unittest.mock.call(
+                    "Lottery replenishment completed: kind=%s purchased=%d target=%d",
+                    LotteryKind.WEAPON.value,
+                    800,
+                    1_000,
+                ),
+                unittest.mock.call(
+                    "Lottery replenishment completed: kind=%s purchased=%d target=%d",
+                    LotteryKind.ARMOR.value,
+                    800,
+                    1_000,
+                ),
+            ],
+        )
         self.assertEqual(
             client.purchase.await_args_list,
             [

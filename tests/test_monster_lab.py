@@ -172,17 +172,21 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
     ) -> None:
         page = _FakeMonsterLabPage(set(MonsterLabFeed))
 
-        report = await MonsterLabClient(
-            _FakeMonsterLabDriver(page),
-            confirmation_checks=2,
-            confirmation_interval=0.01,
-            sleep=_no_sleep,
-        ).feed_all(MonsterLabFeed.FOOD)
+        with self.assertLogs("hvbrowser.monster_lab", level="DEBUG") as captured:
+            report = await MonsterLabClient(
+                _FakeMonsterLabDriver(page),
+                confirmation_checks=2,
+                confirmation_interval=0.01,
+                sleep=_no_sleep,
+            ).feed_all(MonsterLabFeed.FOOD)
 
         self.assertTrue(report.performed)
         self.assertIn(MonsterLabFeed.FOOD, report.before.available_feed_all)
         self.assertNotIn(MonsterLabFeed.FOOD, report.after.available_feed_all)
         self.assertIn(MonsterLabFeed.DRUGS, report.after.available_feed_all)
+        self.assertEqual(len(captured.output), 1)
+        self.assertTrue(captured.output[0].startswith("DEBUG:hvbrowser.monster_lab:"))
+        self.assertIn("Fed all eligible monsters with food", captured.output[0])
         submission_scripts = [
             script for script in page.evaluated if 'do_feed_all("food")' in script
         ]
@@ -265,6 +269,37 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(MonsterLabSubmissionError, "Unable to confirm"):
             await client.feed_all(MonsterLabFeed.FOOD)
 
+    async def test_feed_all_warns_once_after_confirmation_read_recovers(
+        self,
+    ) -> None:
+        page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
+        client = MonsterLabClient(
+            _FakeMonsterLabDriver(page),
+            confirmation_checks=3,
+            confirmation_interval=0.01,
+            sleep=_no_sleep,
+        )
+        before = MonsterLabSnapshot(frozenset({MonsterLabFeed.FOOD}))
+        after = MonsterLabSnapshot(frozenset())
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
+        client._inspect_current = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[
+                MonsterLabPageError("private detail\nsecond line"),
+                after,
+                after,
+            ]
+        )
+
+        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
+            report = await client.feed_all(MonsterLabFeed.FOOD)
+
+        self.assertTrue(report.performed)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("confirmed_attempt=3/3", captured.output[0])
+        self.assertIn("error_count=1", captured.output[0])
+        self.assertIn("last_error_type=MonsterLabPageError", captured.output[0])
+        self.assertNotIn("private detail", captured.output[0])
+
     async def test_confirmation_wait_failure_is_an_unknown_submission(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
 
@@ -292,11 +327,49 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_compatibility_workflow_applies_food_then_drugs(self) -> None:
         driver = object.__new__(HVDriver)
-        client = SimpleNamespace(feed_all=AsyncMock())
+        before = MonsterLabSnapshot(frozenset(MonsterLabFeed))
+        after_food = MonsterLabSnapshot(frozenset({MonsterLabFeed.DRUGS}))
+        after_drugs = MonsterLabSnapshot(frozenset())
+        client = SimpleNamespace(
+            feed_all=AsyncMock(
+                side_effect=[
+                    MonsterLabFeedReport(
+                        MonsterLabFeed.FOOD,
+                        True,
+                        before,
+                        after_food,
+                    ),
+                    MonsterLabFeedReport(
+                        MonsterLabFeed.DRUGS,
+                        True,
+                        after_food,
+                        after_drugs,
+                    ),
+                ]
+            )
+        )
 
-        with patch("hvbrowser.hv.MonsterLabClient", return_value=client):
+        with (
+            patch("hvbrowser.hv.MonsterLabClient", return_value=client),
+            patch("hvbrowser.hv.logger.debug") as debug,
+            patch("hvbrowser.hv.logger.info") as info,
+        ):
             await HVDriver.monstercheck(driver)
 
+        debug.assert_called_once_with("Starting monster check")
+        self.assertEqual(
+            info.call_args_list,
+            [
+                unittest.mock.call(
+                    "Monster check completed: resource=%s outcome=fed-all",
+                    MonsterLabFeed.FOOD.value,
+                ),
+                unittest.mock.call(
+                    "Monster check completed: resource=%s outcome=fed-all",
+                    MonsterLabFeed.DRUGS.value,
+                ),
+            ],
+        )
         self.assertEqual(
             client.feed_all.await_args_list,
             [

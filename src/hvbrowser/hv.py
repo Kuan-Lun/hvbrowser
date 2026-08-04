@@ -1,3 +1,4 @@
+import logging
 import re
 from abc import ABC
 from typing import Any
@@ -114,7 +115,10 @@ class HVDriver(EHDriver):
         return " | ".join([genxpath(imagepath) for imagepath in srclist])
 
     async def goisekai(self) -> None:
-        logger.info("Navigating to HentaiVerse isekai page")
+        logger.debug(
+            "Navigate to HentaiVerse Isekai root: target=%s",
+            HENTAIVERSE_ISEKAI_ROOT_URL,
+        )
         await self.get(HENTAIVERSE_ISEKAI_ROOT_URL)
 
     async def inspect_market(self) -> MarketSnapshot:
@@ -155,9 +159,9 @@ class HVDriver(EHDriver):
 
     async def loetterycheck(self, num: int) -> None:
         """Compatibility wrapper that replenishes both lotteries in order."""
-        logger.info(f"Checking lottery tickets (target: {num})")
         if not isinstance(num, int) or isinstance(num, bool) or num < 0:
             raise ValueError("Lottery target must be a non-negative integer")
+        logger.debug("Checking lottery tickets: target=%d", num)
         client = LotteryClient(self)
         for kind in LotteryKind:
             snapshot = await client.inspect(kind)
@@ -170,6 +174,12 @@ class HVDriver(EHDriver):
                     kind,
                     purchase_amount,
                     expected_before=snapshot,
+                )
+                logger.info(
+                    "Lottery replenishment completed: kind=%s purchased=%d target=%d",
+                    kind.value,
+                    purchase_amount,
+                    num,
                 )
             elif deficit:
                 logger.info(
@@ -193,7 +203,7 @@ class HVDriver(EHDriver):
         return int(match.group(1))
 
     async def recoverstamina(self) -> bool:
-        logger.info("Checking USR RESTORATIVE availability for stamina recovery")
+        logger.debug("Checking USR RESTORATIVE availability for stamina recovery")
 
         stamina_readout = await self.page.select("#stamina_readout")
         await stamina_readout.mouse_move()
@@ -215,7 +225,10 @@ class HVDriver(EHDriver):
             "//p[contains(@class, 'messagebox_error')]", timeout=2
         )
         if error_elements:
-            logger.warning(f"USR RESTORATIVE failed: {error_elements[0].text}")
+            logger.warning(
+                "USR RESTORATIVE failed: server_message=%r",
+                error_elements[0].text,
+            )
             await error_elements[0].click()
             return False
 
@@ -239,37 +252,50 @@ class HVDriver(EHDriver):
 
         submit_elements = await self.page.xpath("//input[@id='equipsubmit']", timeout=5)
         if not submit_elements:
-            logger.warning("Unable to find equipment repair submit button")
+            logger.warning(
+                "Equipment repair check is indeterminate: submit button is "
+                "unavailable; repair was skipped"
+            )
             return None, []
 
         is_disabled = await self.page.evaluate(
             "document.getElementById('equipsubmit').disabled"
         )
-        if is_disabled:
-            debug_state = await self.page.evaluate("""
-                JSON.stringify({
-                    selected_count: selected_count,
-                    selectable_count: selectable_count,
-                    block_submit: block_submit,
-                    materials: (() => {
-                        const totals = {};
-                        for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
-                            if (el.checked && eqitems[el.value]) {
-                                for (const m in eqitems[el.value].m) {
-                                    totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
+        if is_disabled and logger.isEnabledFor(logging.DEBUG):
+            try:
+                debug_state = await self.page.evaluate("""
+                    JSON.stringify({
+                        selected_count: selected_count,
+                        selectable_count: selectable_count,
+                        block_submit: block_submit,
+                        materials: (() => {
+                            const totals = {};
+                            for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
+                                if (el.checked && eqitems[el.value]) {
+                                    for (const m in eqitems[el.value].m) {
+                                        totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
+                                    }
                                 }
                             }
-                        }
-                        return Object.entries(totals).map(([id, need]) => ({
-                            id,
-                            name: itemdata[id] ? itemdata[id].n : undefined,
-                            need,
-                            have: itemdata[id] ? itemdata[id].c : undefined,
-                        }));
-                    })(),
-                })
-                """)
-            logger.warning(f"Not enough materials to repair equipment: {debug_state}")
+                            return Object.entries(totals).map(([id, need]) => ({
+                                id,
+                                name: itemdata[id] ? itemdata[id].n : undefined,
+                                need,
+                                have: itemdata[id] ? itemdata[id].c : undefined,
+                            }));
+                        })(),
+                    })
+                    """)
+            except Exception as error:
+                logger.debug(
+                    "Repair submit diagnostic probe failed: error_type=%s",
+                    type(error).__name__,
+                )
+            else:
+                logger.debug(
+                    "Repair submit disabled at current observation: state=%s",
+                    debug_state,
+                )
 
         return bool(is_disabled), submit_elements
 
@@ -292,7 +318,9 @@ class HVDriver(EHDriver):
             "//div[contains(text(), 'The Armory')]", timeout=5
         )
         if not armory_elements:
-            logger.warning("Unable to find The Armory entry")
+            logger.warning(
+                "Equipment repair check skipped: The Armory entry is unavailable"
+            )
             return False
 
         await bazaar.mouse_move()
@@ -304,13 +332,18 @@ class HVDriver(EHDriver):
             timeout=5,
         )
         if not repair_elements:
-            logger.warning("Unable to find Repair tab")
+            logger.warning("Equipment repair check skipped: Repair tab is unavailable")
             return False
         await self.wait(repair_elements[0].click, ischangeurl=True)
         return True
 
     async def repairequipment(self) -> bool:
-        logger.info("Checking equipped gear for repairs")
+        """Attempt equipment repair while preserving legacy non-blocking outcomes.
+
+        Missing navigation and form controls remain non-blocking for compatibility;
+        their warning messages explicitly identify the skipped or indeterminate check.
+        """
+        logger.debug("Checking equipped gear for repairs")
         if not await self._goto_repair_tab():
             return True
 
@@ -324,7 +357,14 @@ class HVDriver(EHDriver):
         match = re.search(
             r"Selected \d+ of (\d+) matching", equipcount_elements[0].text
         )
-        if not match or int(match.group(1)) == 0:
+        if not match:
+            logger.warning(
+                "Equipment repair check is indeterminate: equipment count is "
+                "unreadable; repair was skipped: text=%r",
+                equipcount_elements[0].text,
+            )
+            return True
+        if int(match.group(1)) == 0:
             logger.debug("No equipment needs repair")
             return True
 
@@ -343,7 +383,10 @@ class HVDriver(EHDriver):
                 "//label[@id='equipcount']", timeout=5
             )
             if not equipcount_reentered:
-                logger.debug("No equipment needs repair after re-entering Repair tab")
+                logger.warning(
+                    "Equipment repair check is indeterminate after re-entering "
+                    "Repair tab: equipment count is unavailable; repair was skipped"
+                )
                 return True
 
             is_disabled, submit_elements = (
@@ -353,11 +396,10 @@ class HVDriver(EHDriver):
                 return True
             if is_disabled:
                 logger.error(
-                    "Still not enough materials to repair equipment "
-                    "after re-entering Repair tab"
+                    "Repair submit remained disabled after re-entering Repair tab"
                 )
                 return False
-            logger.info(
+            logger.warning(
                 "Repair submit was enabled after re-entering Repair tab; "
                 "the earlier disabled check was stale"
             )
@@ -368,21 +410,31 @@ class HVDriver(EHDriver):
         equipcount_after_submit = await self.page.xpath(
             "//label[@id='equipcount']", timeout=5
         )
-        remaining = 0
-        if equipcount_after_submit:
-            match_after_submit = re.search(
-                r"Selected \d+ of (\d+) matching", equipcount_after_submit[0].text
+        if not equipcount_after_submit:
+            logger.info("Repair submitted; no remaining equipment count is visible")
+            return True
+
+        match_after_submit = re.search(
+            r"Selected \d+ of (\d+) matching", equipcount_after_submit[0].text
+        )
+        if not match_after_submit:
+            logger.warning(
+                "Equipment repair outcome is indeterminate after submission: "
+                "remaining count is unreadable: text=%r",
+                equipcount_after_submit[0].text,
             )
-            if match_after_submit:
-                remaining = int(match_after_submit.group(1))
+            return True
+
+        remaining = int(match_after_submit.group(1))
 
         if remaining:
             logger.error(
-                f"Repair submitted but {remaining} pieces of equipment still need repair"
+                "Repair submitted but %d pieces of equipment still need repair",
+                remaining,
             )
             return False
 
-        logger.info("Repaired equipment")
+        logger.info("Repaired equipment: remaining=0")
         return True
 
     async def inspect_monster_lab(self) -> MonsterLabSnapshot:
@@ -395,10 +447,15 @@ class HVDriver(EHDriver):
 
     async def monstercheck(self) -> None:
         """Compatibility wrapper that applies food and then drugs when needed."""
-        logger.info("Starting monster check")
+        logger.debug("Starting monster check")
         client = MonsterLabClient(self)
         for resource in MonsterLabFeed:
-            await client.feed_all(resource)
+            report = await client.feed_all(resource)
+            if report.performed:
+                logger.info(
+                    "Monster check completed: resource=%s outcome=fed-all",
+                    resource.value,
+                )
 
     async def marketcheck(
         self, sellitems: SellItems, *, commit: bool = False

@@ -1,6 +1,6 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser import (
     HENTAIVERSE_ISEKAI_ROOT_URL,
@@ -8,6 +8,7 @@ from hvbrowser import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
 )
+from hvbrowser import hv as hv_module
 
 
 def _maintenance_markers(*, active: bool = False) -> dict[str, bool]:
@@ -106,9 +107,61 @@ class HVDriverRealmTests(unittest.IsolatedAsyncioTestCase):
         driver = object.__new__(HVDriver)
         driver.get = AsyncMock()
 
-        await driver.goisekai()
+        with self.assertLogs("hvbrowser.hv", level="DEBUG") as captured:
+            await driver.goisekai()
 
         driver.get.assert_awaited_once_with(HENTAIVERSE_ISEKAI_ROOT_URL)
+        self.assertEqual(len(captured.output), 1)
+        self.assertTrue(captured.output[0].startswith("DEBUG:hvbrowser.hv:"))
+        self.assertIn(HENTAIVERSE_ISEKAI_ROOT_URL, captured.output[0])
+
+
+class HVDriverStaminaLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_availability_check_is_debug_not_info(self) -> None:
+        stamina_readout = SimpleNamespace(mouse_move=AsyncMock())
+        driver = object.__new__(HVDriver)
+        driver.page = SimpleNamespace(
+            select=AsyncMock(return_value=stamina_readout),
+            xpath=AsyncMock(return_value=[]),
+        )
+
+        with (
+            patch.object(hv_module.logger, "debug") as debug,
+            patch.object(hv_module.logger, "info") as info,
+        ):
+            recovered = await HVDriver.recoverstamina(driver)
+
+        self.assertFalse(recovered)
+        debug.assert_any_call(
+            "Checking USR RESTORATIVE availability for stamina recovery"
+        )
+        info.assert_not_called()
+
+    async def test_server_error_text_is_rendered_on_one_log_line(self) -> None:
+        stamina_readout = SimpleNamespace(mouse_move=AsyncMock())
+        restorative = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        error_message = SimpleNamespace(
+            text="first line\nsecond line\rthird line",
+            click=AsyncMock(),
+        )
+        driver = object.__new__(HVDriver)
+        driver.page = SimpleNamespace(
+            select=AsyncMock(return_value=stamina_readout),
+            xpath=AsyncMock(side_effect=[[restorative], [error_message]]),
+            wait=AsyncMock(),
+        )
+
+        with self.assertLogs("hvbrowser.hv", level="WARNING") as captured:
+            recovered = await HVDriver.recoverstamina(driver)
+
+        self.assertFalse(recovered)
+        self.assertEqual(len(captured.output), 1)
+        self.assertNotIn("\n", captured.output[0])
+        self.assertNotIn("\r", captured.output[0])
+        self.assertIn(r"first line\nsecond line\rthird line", captured.output[0])
 
 
 class HVDriverRepairNavigationTests(unittest.IsolatedAsyncioTestCase):
@@ -159,6 +212,278 @@ class HVDriverRepairNavigationTests(unittest.IsolatedAsyncioTestCase):
         driver.page.select.assert_not_awaited()
         driver.page.xpath.assert_not_awaited()
         driver.wait.assert_not_awaited()
+
+
+class HVDriverRepairLoggingTests(unittest.IsolatedAsyncioTestCase):
+    async def test_routine_check_is_debug_not_info(self) -> None:
+        driver = object.__new__(HVDriver)
+        driver._goto_repair_tab = AsyncMock(return_value=False)
+
+        with (
+            patch.object(hv_module.logger, "debug") as debug,
+            patch.object(hv_module.logger, "info") as info,
+        ):
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        debug.assert_called_once_with("Checking equipped gear for repairs")
+        info.assert_not_called()
+
+    async def test_initial_disabled_submit_is_debug_until_fresh_verification(
+        self,
+    ) -> None:
+        driver = object.__new__(HVDriver)
+        equipcount = SimpleNamespace(
+            text="Selected 0 of 1 matching",
+            mouse_click=AsyncMock(),
+        )
+        submit = object()
+        debug_state = '{"selected_count":1}'
+        driver.wait = AsyncMock()
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [submit]]),
+            evaluate=AsyncMock(side_effect=[True, debug_state]),
+        )
+
+        with (
+            patch.object(hv_module.logger, "isEnabledFor", return_value=True),
+            patch.object(hv_module.logger, "debug") as debug,
+            patch.object(hv_module.logger, "warning") as warning,
+        ):
+            disabled, submit_elements = (
+                await HVDriver._select_all_and_check_repair_submit(
+                    driver,
+                    [equipcount],
+                )
+            )
+
+        self.assertTrue(disabled)
+        self.assertEqual(submit_elements, [submit])
+        debug.assert_any_call(
+            "Repair submit disabled at current observation: state=%s",
+            debug_state,
+        )
+        warning.assert_not_called()
+
+    async def test_disabled_submit_skips_debug_probe_when_debug_is_off(self) -> None:
+        driver = object.__new__(HVDriver)
+        equipcount = SimpleNamespace(
+            text="Selected 0 of 1 matching",
+            mouse_click=AsyncMock(),
+        )
+        submit = object()
+        driver.wait = AsyncMock()
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [submit]]),
+            evaluate=AsyncMock(return_value=True),
+        )
+
+        with (
+            patch.object(hv_module.logger, "isEnabledFor", return_value=False),
+            patch.object(hv_module.logger, "debug") as debug,
+        ):
+            disabled, submit_elements = (
+                await HVDriver._select_all_and_check_repair_submit(
+                    driver,
+                    [equipcount],
+                )
+            )
+
+        self.assertTrue(disabled)
+        self.assertEqual(submit_elements, [submit])
+        driver.page.evaluate.assert_awaited_once_with(
+            "document.getElementById('equipsubmit').disabled"
+        )
+        self.assertFalse(
+            any(
+                call.args
+                and call.args[0]
+                == "Repair submit disabled at current observation: state=%s"
+                for call in debug.call_args_list
+            )
+        )
+
+    async def test_debug_probe_failure_does_not_change_repair_state(self) -> None:
+        driver = object.__new__(HVDriver)
+        equipcount = SimpleNamespace(
+            text="Selected 0 of 1 matching",
+            mouse_click=AsyncMock(),
+        )
+        submit = object()
+        driver.wait = AsyncMock()
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [submit]]),
+            evaluate=AsyncMock(
+                side_effect=[True, RuntimeError("diagnostic evaluation failed")]
+            ),
+        )
+
+        with (
+            patch.object(hv_module.logger, "isEnabledFor", return_value=True),
+            patch.object(hv_module.logger, "debug") as debug,
+        ):
+            disabled, submit_elements = (
+                await HVDriver._select_all_and_check_repair_submit(
+                    driver,
+                    [equipcount],
+                )
+            )
+
+        self.assertTrue(disabled)
+        self.assertEqual(submit_elements, [submit])
+        debug.assert_any_call(
+            "Repair submit diagnostic probe failed: error_type=%s",
+            "RuntimeError",
+        )
+
+    async def test_missing_submit_logs_indeterminate_legacy_outcome(self) -> None:
+        driver = object.__new__(HVDriver)
+        equipcount = SimpleNamespace(
+            text="Selected 0 of 1 matching",
+            mouse_click=AsyncMock(),
+        )
+        driver.wait = AsyncMock()
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], []]),
+            evaluate=AsyncMock(),
+        )
+
+        with patch.object(hv_module.logger, "warning") as warning:
+            disabled, submit_elements = (
+                await HVDriver._select_all_and_check_repair_submit(
+                    driver,
+                    [equipcount],
+                )
+            )
+
+        self.assertIsNone(disabled)
+        self.assertEqual(submit_elements, [])
+        warning.assert_called_once_with(
+            "Equipment repair check is indeterminate: submit button is "
+            "unavailable; repair was skipped"
+        )
+        driver.page.evaluate.assert_not_awaited()
+
+    async def test_missing_armory_logs_skipped_non_blocking_outcome(self) -> None:
+        driver, bazaar, _armory, _repair = _repair_driver(
+            "https://hentaiverse.org/?s=Bazaar&ss=es",
+            marker_payloads=[_maintenance_markers()],
+        )
+        driver.page.select.return_value = bazaar
+        driver.page.xpath.side_effect = [[]]
+
+        with patch.object(hv_module.logger, "warning") as warning:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        warning.assert_called_once_with(
+            "Equipment repair check skipped: The Armory entry is unavailable"
+        )
+
+    async def test_missing_repair_tab_logs_skipped_non_blocking_outcome(self) -> None:
+        driver, bazaar, armory, _repair = _repair_driver(
+            "https://hentaiverse.org/?s=Bazaar&ss=es",
+            marker_payloads=[_maintenance_markers()],
+        )
+        driver.page.select.return_value = bazaar
+        driver.page.xpath.side_effect = [[armory], []]
+
+        with patch.object(hv_module.logger, "warning") as warning:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        warning.assert_called_once_with(
+            "Equipment repair check skipped: Repair tab is unavailable"
+        )
+
+    async def test_missing_post_submit_count_does_not_claim_repair(self) -> None:
+        driver = object.__new__(HVDriver)
+        driver._goto_repair_tab = AsyncMock(return_value=True)
+        equipcount = SimpleNamespace(text="Selected 0 of 1 matching")
+        submit = SimpleNamespace(mouse_click=AsyncMock())
+        driver._select_all_and_check_repair_submit = AsyncMock(
+            return_value=(False, [submit])
+        )
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], []]),
+            wait=AsyncMock(),
+        )
+
+        with patch.object(hv_module.logger, "info") as info:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        info.assert_called_once_with(
+            "Repair submitted; no remaining equipment count is visible"
+        )
+
+    async def test_unreadable_post_submit_count_is_logged_as_indeterminate(
+        self,
+    ) -> None:
+        driver = object.__new__(HVDriver)
+        driver._goto_repair_tab = AsyncMock(return_value=True)
+        equipcount = SimpleNamespace(text="Selected 0 of 1 matching")
+        unreadable = SimpleNamespace(text="remaining unknown\nretry later")
+        submit = SimpleNamespace(mouse_click=AsyncMock())
+        driver._select_all_and_check_repair_submit = AsyncMock(
+            return_value=(False, [submit])
+        )
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [unreadable]]),
+            wait=AsyncMock(),
+        )
+
+        with self.assertLogs("hvbrowser.hv", level="WARNING") as captured:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        self.assertEqual(len(captured.output), 1)
+        self.assertIn("outcome is indeterminate", captured.output[0])
+        self.assertIn(r"remaining unknown\nretry later", captured.output[0])
+        self.assertNotIn("\n", captured.output[0])
+
+    async def test_zero_post_submit_count_confirms_repair(self) -> None:
+        driver = object.__new__(HVDriver)
+        driver._goto_repair_tab = AsyncMock(return_value=True)
+        equipcount = SimpleNamespace(text="Selected 0 of 1 matching")
+        repaired_count = SimpleNamespace(text="Selected 0 of 0 matching")
+        submit = SimpleNamespace(mouse_click=AsyncMock())
+        driver._select_all_and_check_repair_submit = AsyncMock(
+            return_value=(False, [submit])
+        )
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [repaired_count]]),
+            wait=AsyncMock(),
+        )
+
+        with patch.object(hv_module.logger, "info") as info:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        info.assert_called_once_with("Repaired equipment: remaining=0")
+
+    async def test_stale_disabled_submit_recovery_is_a_warning(self) -> None:
+        driver = object.__new__(HVDriver)
+        driver._goto_repair_tab = AsyncMock(side_effect=[True, True])
+        equipcount = SimpleNamespace(text="Selected 0 of 1 matching")
+        submit = SimpleNamespace(mouse_click=AsyncMock())
+        driver._select_all_and_check_repair_submit = AsyncMock(
+            side_effect=[(True, []), (False, [submit])]
+        )
+        driver.page = SimpleNamespace(
+            xpath=AsyncMock(side_effect=[[equipcount], [equipcount], []]),
+            wait=AsyncMock(),
+        )
+
+        with patch.object(hv_module.logger, "warning") as warning:
+            repaired = await HVDriver.repairequipment(driver)
+
+        self.assertTrue(repaired)
+        warning.assert_called_once_with(
+            "Repair submit was enabled after re-entering Repair tab; "
+            "the earlier disabled check was stale"
+        )
+        submit.mouse_click.assert_awaited_once_with()
 
 
 if __name__ == "__main__":
