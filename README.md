@@ -5,9 +5,9 @@ HVBrowser provides browser automation APIs for HentaiVerse. It builds on
 
 The package was extracted from the historical combined `hbrowser`
 distribution. Battle-domain APIs live in the separate `hvbattle` package.
-HVBrowser 0.1.4 requires `hbrowser>=0.35.2,<0.36`; version 0.35.2 is the
-minimum release that provides the optional process-log API used when the
-calling application has no external output supervisor.
+HVBrowser 0.1.7 requires `hbrowser>=0.36.0,<0.37`. HBrowser 0.36 separates
+FlareSolverr session recovery from main-browser and network-route lifecycle;
+it also removes the former proxy-rotator driver API.
 
 ## Lottery and Monster Lab APIs
 
