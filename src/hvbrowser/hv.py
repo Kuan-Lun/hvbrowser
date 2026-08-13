@@ -202,6 +202,21 @@ class HVDriver(EHDriver):
             )
         return int(match.group(1))
 
+    async def get_level(self) -> int:
+        """Return the character level shown by the current HentaiVerse page."""
+        try:
+            level_readout = await self.page.select("#level_readout", timeout=5)
+        except TimeoutError as error:
+            raise ValueError("Unable to find level readout") from error
+
+        match = re.search(
+            r"(?:^|\s)Lv\.\s*([0-9]+)\s*$",
+            level_readout.text,
+        )
+        if not match:
+            raise ValueError(f"Unable to parse level from: {level_readout.text!r}")
+        return int(match.group(1))
+
     async def recoverstamina(self) -> bool:
         logger.debug("Checking USR RESTORATIVE availability for stamina recovery")
 

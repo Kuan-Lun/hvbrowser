@@ -116,6 +116,56 @@ class HVDriverRealmTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(HENTAIVERSE_ISEKAI_ROOT_URL, captured.output[0])
 
 
+class HVDriverLevelTests(unittest.IsolatedAsyncioTestCase):
+    async def test_level_is_parsed_from_the_visible_readout_text(self) -> None:
+        for text, expected in (
+            ("PFUDOR Lv.500", 500),
+            ("Lv.1", 1),
+            ("  Nightmare\tLv. 365\n", 365),
+        ):
+            with self.subTest(text=text):
+                level_readout = SimpleNamespace(text=text)
+                driver = object.__new__(HVDriver)
+                driver.page = SimpleNamespace(
+                    select=AsyncMock(return_value=level_readout)
+                )
+
+                self.assertEqual(await driver.get_level(), expected)
+                driver.page.select.assert_awaited_once_with(
+                    "#level_readout",
+                    timeout=5,
+                )
+
+    async def test_missing_level_readout_raises_value_error(self) -> None:
+        driver = object.__new__(HVDriver)
+        driver.page = SimpleNamespace(
+            select=AsyncMock(side_effect=TimeoutError("missing"))
+        )
+
+        with self.assertRaisesRegex(ValueError, "find level readout"):
+            await driver.get_level()
+
+    async def test_malformed_level_readout_raises_value_error(self) -> None:
+        malformed_texts = (
+            "PFUDOR 500",
+            "PFUDOR lv.500",
+            "PFUDOR Lv.-1",
+            "PFUDOR Lv.500 EXP",
+            "PFUDOR Lv.500.0",
+            "PFUDOR Lv.\uff15\uff10\uff10",
+        )
+
+        for text in malformed_texts:
+            with self.subTest(text=text):
+                driver = object.__new__(HVDriver)
+                driver.page = SimpleNamespace(
+                    select=AsyncMock(return_value=SimpleNamespace(text=text))
+                )
+
+                with self.assertRaisesRegex(ValueError, "parse level"):
+                    await driver.get_level()
+
+
 class HVDriverStaminaLoggingTests(unittest.IsolatedAsyncioTestCase):
     async def test_availability_check_is_debug_not_info(self) -> None:
         stamina_readout = SimpleNamespace(mouse_move=AsyncMock())

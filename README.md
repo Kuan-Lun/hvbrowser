@@ -9,6 +9,11 @@ HVBrowser 0.1.7 requires `hbrowser>=0.36.0,<0.37`. HBrowser 0.36 separates
 FlareSolverr session recovery from main-browser and network-route lifecycle;
 it also removes the former proxy-rotator driver API.
 
+`HVDriver.get_level()` reads the visible character level from the current
+HentaiVerse page. A missing or malformed readout raises instead of inventing a
+level, allowing application-owned daily challenge caches to invalidate safely
+when a character levels up.
+
 ## Lottery and Monster Lab APIs
 
 Lottery inspection is read-only and returns the current ticket count, shared GP
