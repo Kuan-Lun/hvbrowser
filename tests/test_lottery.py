@@ -1,17 +1,21 @@
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from typing import Any
+from unittest.mock import AsyncMock
 
 from hvbrowser import (
-    HVDriver,
     LotteryClient,
     LotteryKind,
     LotteryPageError,
-    LotteryPurchaseReport,
     LotterySnapshot,
     LotteryStateChangedError,
     LotterySubmissionError,
 )
+
+
+def _client(driver: object, **kwargs: Any) -> LotteryClient:
+    navigation = SimpleNamespace(select_bazaar=AsyncMock())
+    return LotteryClient(driver, navigation, **kwargs)  # type: ignore[arg-type]
 
 
 class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
@@ -19,13 +23,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         driver = SimpleNamespace(page=SimpleNamespace())
 
         with self.assertRaisesRegex(ValueError, "at least 1"):
-            LotteryClient(driver, confirmation_checks=0)  # type: ignore[arg-type]
+            _client(driver, confirmation_checks=0)
         with self.assertRaisesRegex(ValueError, "at least 1"):
-            LotteryClient(driver, confirmation_checks=True)  # type: ignore[arg-type]
+            _client(driver, confirmation_checks=True)
         with self.assertRaisesRegex(ValueError, "finite non-negative"):
-            LotteryClient(  # type: ignore[arg-type]
-                driver, confirmation_interval=float("nan")
-            )
+            _client(driver, confirmation_interval=float("nan"))
 
     async def test_inspect_parses_gp_and_ticket_counts(self) -> None:
         page = SimpleNamespace()
@@ -36,7 +38,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             ]
         )
         driver = SimpleNamespace(page=page)
-        client = LotteryClient(driver)  # type: ignore[arg-type]
+        client = _client(driver)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
         snapshot = await client.inspect(LotteryKind.WEAPON)
@@ -45,7 +47,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inspect_rejects_invalid_kind_before_navigation(self) -> None:
         driver = SimpleNamespace(page=SimpleNamespace())
-        client = LotteryClient(driver)  # type: ignore[arg-type]
+        client = _client(driver)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(TypeError, "LotteryKind"):
@@ -62,16 +64,14 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 ]
             )
         )
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(LotteryPageError, "GP balance"):
             await client.inspect(LotteryKind.ARMOR)
 
     async def test_purchase_rejects_invalid_amount_before_inspection(self) -> None:
-        client = LotteryClient(  # type: ignore[arg-type]
-            SimpleNamespace(page=SimpleNamespace())
-        )
+        client = _client(SimpleNamespace(page=SimpleNamespace()))
         client.inspect = AsyncMock()  # type: ignore[method-assign]
 
         for invalid in (0, -1, True, 1.5):
@@ -90,7 +90,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             select=AsyncMock(),
             evaluate=AsyncMock(),
         )
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.ARMOR, 799_999, 100)
         )
@@ -104,9 +104,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_purchase_rejects_invalid_expected_snapshot_before_inspection(
         self,
     ) -> None:
-        client = LotteryClient(  # type: ignore[arg-type]
-            SimpleNamespace(page=SimpleNamespace())
-        )
+        client = _client(SimpleNamespace(page=SimpleNamespace()))
         client.inspect = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(TypeError, "LotterySnapshot or None"):
@@ -124,7 +122,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         page = SimpleNamespace(select=AsyncMock(), evaluate=AsyncMock())
         expected = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
         changed = LotterySnapshot(LotteryKind.WEAPON, 1_500_000, 300)
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client.inspect = AsyncMock(return_value=changed)  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(LotteryStateChangedError, "plan again"):
@@ -142,7 +140,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             select=AsyncMock(return_value=None),
             evaluate=AsyncMock(),
         )
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
@@ -161,7 +159,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             select=AsyncMock(return_value=ticket_input),
             evaluate=AsyncMock(return_value=False),
         )
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
@@ -180,7 +178,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             select=AsyncMock(return_value=ticket_input),
             evaluate=AsyncMock(side_effect=[True, RuntimeError("disconnected")]),
         )
-        client = LotteryClient(SimpleNamespace(page=page))  # type: ignore[arg-type]
+        client = _client(SimpleNamespace(page=page))
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
@@ -198,9 +196,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             evaluate=AsyncMock(side_effect=[True, None]),
         )
         driver = SimpleNamespace(page=page)
-        client = LotteryClient(  # type: ignore[arg-type]
-            driver, confirmation_checks=1, confirmation_interval=0
-        )
+        client = _client(driver, confirmation_checks=1, confirmation_interval=0)
         before = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
         after = LotterySnapshot(LotteryKind.WEAPON, 800_000, 1_000)
         client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
@@ -241,7 +237,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             select=AsyncMock(return_value=ticket_input),
             evaluate=AsyncMock(side_effect=[True, None]),
         )
-        client = LotteryClient(  # type: ignore[arg-type]
+        client = _client(
             SimpleNamespace(page=page),
             confirmation_checks=2,
             confirmation_interval=0,
@@ -280,9 +276,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             evaluate=AsyncMock(side_effect=[True, None]),
         )
         driver = SimpleNamespace(page=page)
-        client = LotteryClient(  # type: ignore[arg-type]
-            driver, confirmation_checks=1, confirmation_interval=0
-        )
+        client = _client(driver, confirmation_checks=1, confirmation_interval=0)
         before = LotterySnapshot(LotteryKind.ARMOR, 800_000, 100)
         unchanged = LotterySnapshot(LotteryKind.ARMOR, 800_000, 100)
         client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
@@ -292,97 +286,6 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaises(LotterySubmissionError):
             await client.purchase(LotteryKind.ARMOR, 800)
-
-    async def test_compatibility_workflow_allocates_shared_gp_in_order(self) -> None:
-        driver = object.__new__(HVDriver)
-        client = SimpleNamespace(
-            inspect=AsyncMock(
-                side_effect=[
-                    LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200),
-                    LotterySnapshot(LotteryKind.ARMOR, 800_000, 100),
-                ]
-            ),
-            purchase=AsyncMock(),
-        )
-
-        with (
-            patch("hvbrowser.hv.LotteryClient", return_value=client),
-            patch("hvbrowser.hv.logger.debug") as debug,
-            patch("hvbrowser.hv.logger.info") as info,
-        ):
-            await HVDriver.loetterycheck(driver, 1_000)
-
-        debug.assert_called_once_with("Checking lottery tickets: target=%d", 1_000)
-        self.assertEqual(
-            info.call_args_list,
-            [
-                unittest.mock.call(
-                    "Lottery replenishment completed: kind=%s purchased=%d target=%d",
-                    LotteryKind.WEAPON.value,
-                    800,
-                    1_000,
-                ),
-                unittest.mock.call(
-                    "Lottery replenishment completed: kind=%s purchased=%d target=%d",
-                    LotteryKind.ARMOR.value,
-                    800,
-                    1_000,
-                ),
-            ],
-        )
-        self.assertEqual(
-            client.purchase.await_args_list,
-            [
-                unittest.mock.call(
-                    LotteryKind.WEAPON,
-                    800,
-                    expected_before=LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200),
-                ),
-                unittest.mock.call(
-                    LotteryKind.ARMOR,
-                    800,
-                    expected_before=LotterySnapshot(LotteryKind.ARMOR, 800_000, 100),
-                ),
-            ],
-        )
-
-    async def test_hvdriver_exposes_explicit_lottery_operations(self) -> None:
-        driver = object.__new__(HVDriver)
-        before = LotterySnapshot(LotteryKind.ARMOR, 10_000, 10)
-        after = LotterySnapshot(LotteryKind.ARMOR, 9_000, 11)
-        report = LotteryPurchaseReport(before, 1, after)
-        client = SimpleNamespace(
-            inspect=AsyncMock(return_value=before),
-            purchase=AsyncMock(return_value=report),
-        )
-
-        with patch("hvbrowser.hv.LotteryClient", return_value=client):
-            inspected = await HVDriver.inspect_lottery(driver, LotteryKind.ARMOR)
-            purchased = await HVDriver.purchase_lottery_tickets(
-                driver,
-                LotteryKind.ARMOR,
-                1,
-                expected_before=before,
-            )
-
-        self.assertIs(inspected, before)
-        self.assertIs(purchased, report)
-        client.inspect.assert_awaited_once_with(LotteryKind.ARMOR)
-        client.purchase.assert_awaited_once_with(
-            LotteryKind.ARMOR,
-            1,
-            expected_before=before,
-        )
-
-    async def test_compatibility_workflow_rejects_invalid_target(self) -> None:
-        driver = object.__new__(HVDriver)
-
-        for invalid in (-1, True, 1.5):
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(ValueError, "non-negative integer"):
-                    await HVDriver.loetterycheck(  # type: ignore[arg-type]
-                        driver, invalid
-                    )
 
 
 if __name__ == "__main__":

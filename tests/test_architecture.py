@@ -5,7 +5,7 @@ from pathlib import Path
 from hvbrowser import (
     HENTAIVERSE_ISEKAI_ROOT_URL,
     HENTAIVERSE_ROOT_URL,
-    HVDriver,
+    HentaiVerseSession,
 )
 
 
@@ -35,10 +35,16 @@ class ArchitectureTests(unittest.TestCase):
         self.assertEqual(list(source_root.glob("hv_battle*.py")), [])
 
     def test_hvbrowser_owns_and_installs_hentaiverse_urls(self) -> None:
-        driver = HVDriver(headless=True)
+        session = HentaiVerseSession(headless=True)
 
-        self.assertEqual(driver.url["HentaiVerse"], HENTAIVERSE_ROOT_URL)
-        self.assertEqual(driver.url["HentaiVerse isekai"], HENTAIVERSE_ISEKAI_ROOT_URL)
+        self.assertEqual(
+            session.browser.url["HentaiVerse"],
+            HENTAIVERSE_ROOT_URL,
+        )
+        self.assertEqual(
+            session.browser.url["HentaiVerse isekai"],
+            HENTAIVERSE_ISEKAI_ROOT_URL,
+        )
 
 
 if __name__ == "__main__":

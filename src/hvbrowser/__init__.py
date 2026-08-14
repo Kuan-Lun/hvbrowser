@@ -1,38 +1,15 @@
-__all__ = [
-    "HVDriver",
-    "SellItems",
-    "MarketCategory",
-    "MarketClient",
-    "MarketItem",
-    "MarketPageError",
-    "MarketSale",
-    "MarketSalePlan",
-    "MarketSaleQuote",
-    "MarketSaleReport",
-    "MarketSnapshot",
-    "MarketSubmissionError",
-    "LotteryClient",
-    "LotteryKind",
-    "LotteryPageError",
-    "LotteryPurchaseReport",
-    "LotterySnapshot",
-    "LotteryStateChangedError",
-    "LotterySubmissionError",
-    "LOTTERY_TICKET_PRICE_GP",
-    "MaintenanceNavigationBlockedError",
-    "MaintenanceNavigationBlocker",
-    "MonsterLabClient",
-    "MonsterLabFeed",
-    "MonsterLabFeedReport",
-    "MonsterLabPageError",
-    "MonsterLabSnapshot",
-    "MonsterLabSubmissionError",
-    "HENTAIVERSE_ISEKAI_ROOT_URL",
-    "HENTAIVERSE_ROOT_URL",
-]
+"""Public HentaiVerse browser composition API."""
 
-
-from .hv import HVDriver, SellItems
+from .equipment_repair import (
+    EquipmentRepairClient,
+    EquipmentRepairOutcome,
+    EquipmentRepairPageError,
+    EquipmentRepairReport,
+    EquipmentRepairSnapshot,
+    EquipmentRepairStateChangedError,
+    EquipmentRepairSubmissionError,
+)
+from .hv import HVDriver
 from .lottery import (
     LOTTERY_TICKET_PRICE_GP,
     LotteryClient,
@@ -46,6 +23,8 @@ from .lottery import (
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
+    MaintenanceNavigator,
+    classify_maintenance_navigation_blocker,
 )
 from .market import (
     MarketCategory,
@@ -56,6 +35,7 @@ from .market import (
     MarketSalePlan,
     MarketSaleQuote,
     MarketSaleReport,
+    MarketSaleRequest,
     MarketSnapshot,
     MarketSubmissionError,
 )
@@ -67,4 +47,69 @@ from .monster_lab import (
     MonsterLabSnapshot,
     MonsterLabSubmissionError,
 )
+from .player import (
+    PlayerClient,
+    PlayerPageError,
+    PlayerSnapshot,
+    PlayerStateChangedError,
+    StaminaRecoveryError,
+    StaminaRecoveryOutcome,
+    StaminaRecoveryReport,
+)
+from .realm import Realm, RealmDetectionError, RealmNavigator, realm_from_url
+from .session import HentaiVerseSession
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
+
+__all__ = [
+    "EquipmentRepairClient",
+    "EquipmentRepairOutcome",
+    "EquipmentRepairPageError",
+    "EquipmentRepairReport",
+    "EquipmentRepairSnapshot",
+    "EquipmentRepairStateChangedError",
+    "EquipmentRepairSubmissionError",
+    "HENTAIVERSE_ISEKAI_ROOT_URL",
+    "HENTAIVERSE_ROOT_URL",
+    "HVDriver",
+    "HentaiVerseSession",
+    "LOTTERY_TICKET_PRICE_GP",
+    "LotteryClient",
+    "LotteryKind",
+    "LotteryPageError",
+    "LotteryPurchaseReport",
+    "LotterySnapshot",
+    "LotteryStateChangedError",
+    "LotterySubmissionError",
+    "MaintenanceNavigationBlockedError",
+    "MaintenanceNavigationBlocker",
+    "MaintenanceNavigator",
+    "MarketCategory",
+    "MarketClient",
+    "MarketItem",
+    "MarketPageError",
+    "MarketSale",
+    "MarketSalePlan",
+    "MarketSaleQuote",
+    "MarketSaleReport",
+    "MarketSaleRequest",
+    "MarketSnapshot",
+    "MarketSubmissionError",
+    "MonsterLabClient",
+    "MonsterLabFeed",
+    "MonsterLabFeedReport",
+    "MonsterLabPageError",
+    "MonsterLabSnapshot",
+    "MonsterLabSubmissionError",
+    "PlayerClient",
+    "PlayerPageError",
+    "PlayerSnapshot",
+    "PlayerStateChangedError",
+    "Realm",
+    "RealmDetectionError",
+    "RealmNavigator",
+    "StaminaRecoveryError",
+    "StaminaRecoveryOutcome",
+    "StaminaRecoveryReport",
+    "classify_maintenance_navigation_blocker",
+    "realm_from_url",
+]

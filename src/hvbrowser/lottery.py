@@ -9,8 +9,9 @@ from typing import Any, Protocol
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
-    select_bazaar_for_maintenance,
+    MaintenanceNavigator,
 )
+from .realm import Realm
 from .runtime import setup_logger
 
 logger = setup_logger(__name__)
@@ -57,8 +58,6 @@ class LotteryStateChangedError(RuntimeError):
 class _LotteryDriver(Protocol):
     page: Any
 
-    async def gohomepage(self, force: bool = False) -> None: ...
-
 
 def _parse_first_integer(text: str, *, field: str) -> int:
     match = re.search(r"\d[\d,]*", text)
@@ -73,6 +72,7 @@ class LotteryClient:
     def __init__(
         self,
         driver: _LotteryDriver,
+        navigation: MaintenanceNavigator,
         *,
         confirmation_checks: int = 5,
         confirmation_interval: float = 0.5,
@@ -92,6 +92,7 @@ class LotteryClient:
                 "confirmation_interval must be a finite non-negative number"
             )
         self.driver = driver
+        self.navigation = navigation
         self.confirmation_checks = confirmation_checks
         self.confirmation_interval = confirmation_interval
 
@@ -216,7 +217,10 @@ class LotteryClient:
 
     async def _navigate(self, kind: LotteryKind) -> None:
         try:
-            bazaar = await select_bazaar_for_maintenance(self.driver)
+            bazaar = await self.navigation.select_bazaar(
+                Realm.PERSISTENT,
+                navigate_first=True,
+            )
         except MaintenanceNavigationBlockedError:
             raise
         except Exception as error:

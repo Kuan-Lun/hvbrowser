@@ -5,10 +5,11 @@ from collections import Counter
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
-from .hv import HVDriver
-from .lottery import LotteryClient, LotteryKind
-from .market import MarketCategory, MarketClient, MarketPageError
-from .monster_lab import MonsterLabClient, MonsterLabFeed
+from .lottery import LotteryKind
+from .market import MarketCategory, MarketPageError
+from .monster_lab import MonsterLabFeed
+from .realm import Realm
+from .session import HentaiVerseSession
 
 
 class LiveProbeRefused(RuntimeError):
@@ -51,7 +52,7 @@ class MonsterLabSummary:
 @dataclass(frozen=True)
 class LiveProbeResult:
     stamina: int
-    is_isekai: bool
+    realm: Realm
     market: tuple[MarketCategorySummary, ...]
     quote: MarketQuoteSummary | None
     lotteries: tuple[LotterySummary, ...]
@@ -76,28 +77,30 @@ async def run_live_probe(
     inspect_market_form: bool = False,
     inspect_lotteries: bool = False,
     inspect_monster_lab: bool = False,
-    driver_factory: Callable[[], HVDriver] | None = None,
+    session_factory: Callable[[], HentaiVerseSession] | None = None,
     environment: Mapping[str, str] | None = None,
 ) -> LiveProbeResult:
     """Log in and inspect non-battle state without performing any mutation."""
     if inspect_market_form and not inspect_market:
         raise ValueError("inspect_market_form requires inspect_market to be enabled")
     validate_live_environment(environment)
-    create_driver = driver_factory or (lambda: HVDriver(headless=True))
+    create_session = session_factory or (lambda: HentaiVerseSession(headless=True))
 
-    async with create_driver() as driver:
-        battle_markers = await driver.page.xpath(_ACTIVE_BATTLE_XPATH, timeout=2)
+    async with create_session() as session:
+        battle_markers = await session.browser.page.xpath(
+            _ACTIVE_BATTLE_XPATH,
+            timeout=2,
+        )
         if battle_markers:
             raise LiveProbeRefused(
                 "An active battle was detected; the read-only probe stopped"
             )
 
-        stamina = await driver.get_stamina()
-        is_isekai = await driver.is_isekai
+        stamina = await session.player.read_stamina()
+        realm = await session.realm.current()
 
         lottery_summaries: tuple[LotterySummary, ...] = ()
-        if inspect_lotteries and not is_isekai:
-            lottery_client = LotteryClient(driver)
+        if inspect_lotteries and realm is Realm.PERSISTENT:
             lottery_summaries = tuple(
                 LotterySummary(
                     kind=snapshot.kind,
@@ -106,13 +109,13 @@ async def run_live_probe(
                     ticket_price_gp=snapshot.ticket_price_gp,
                 )
                 for snapshot in [
-                    await lottery_client.inspect(kind) for kind in LotteryKind
+                    await session.lottery.inspect(kind) for kind in LotteryKind
                 ]
             )
 
         monster_lab_summary: MonsterLabSummary | None = None
-        if inspect_monster_lab and not is_isekai:
-            monster_snapshot = await MonsterLabClient(driver).inspect()
+        if inspect_monster_lab and realm is Realm.PERSISTENT:
+            monster_snapshot = await session.monster_lab.inspect()
             monster_lab_summary = MonsterLabSummary(
                 food_available=(
                     MonsterLabFeed.FOOD in monster_snapshot.available_feed_all
@@ -125,8 +128,7 @@ async def run_live_probe(
         categories: tuple[MarketCategorySummary, ...] = ()
         quote_summary: MarketQuoteSummary | None = None
         if inspect_market:
-            market_client = MarketClient(driver)
-            snapshot = await market_client.inspect(is_isekai=is_isekai)
+            snapshot = await session.market.inspect()
 
             item_counts = Counter(item.category for item in snapshot.items)
             stocked_counts = Counter(
@@ -145,8 +147,9 @@ async def run_live_probe(
             if inspect_market_form:
                 for item in (item for item in snapshot.items if item.stock > 0):
                     try:
-                        quote = await market_client.inspect_sale_quote(
-                            item, is_isekai=is_isekai
+                        quote = await session.market.inspect_sale_quote(
+                            item,
+                            realm=snapshot.realm,
                         )
                     except MarketPageError:
                         continue
@@ -161,7 +164,7 @@ async def run_live_probe(
 
         return LiveProbeResult(
             stamina=stamina,
-            is_isekai=is_isekai,
+            realm=realm,
             market=categories,
             quote=quote_summary,
             lotteries=lottery_summaries,

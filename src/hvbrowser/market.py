@@ -1,9 +1,9 @@
 import re
-from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
+from .realm import Realm, RealmNavigator
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 MARKET_ROOT_URL = f"{HENTAIVERSE_ROOT_URL}/"
@@ -52,7 +52,7 @@ class MarketItem:
 
 @dataclass(frozen=True)
 class MarketSnapshot:
-    is_isekai: bool
+    realm: Realm
     items: tuple[MarketItem, ...]
 
     def items_in(self, category: MarketCategory) -> tuple[MarketItem, ...]:
@@ -63,7 +63,7 @@ class MarketSnapshot:
 class MarketSalePlan:
     """A read-only snapshot of inventory selected for sale."""
 
-    is_isekai: bool
+    realm: Realm
     items: tuple[MarketItem, ...]
 
     @property
@@ -89,8 +89,30 @@ class MarketSale:
 
 @dataclass(frozen=True)
 class MarketSaleReport:
-    is_isekai: bool
+    realm: Realm
     sales: tuple[MarketSale, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class MarketSaleRequest:
+    """Item names selected for a read-only Market sale plan."""
+
+    consumables: tuple[str, ...] = ()
+    materials: tuple[str, ...] = ()
+    trophies: tuple[str, ...] = ()
+    artifacts: tuple[str, ...] = ()
+    figures: tuple[str, ...] = ()
+    monster_items: tuple[str, ...] = ()
+
+    def names_by_category(self) -> dict[MarketCategory, tuple[str, ...]]:
+        return {
+            MarketCategory.CONSUMABLES: self.consumables,
+            MarketCategory.MATERIALS: self.materials,
+            MarketCategory.TROPHIES: self.trophies,
+            MarketCategory.ARTIFACTS: self.artifacts,
+            MarketCategory.FIGURES: self.figures,
+            MarketCategory.MONSTER_ITEMS: self.monster_items,
+        }
 
 
 class MarketPageError(RuntimeError):
@@ -116,15 +138,17 @@ class _SaleForm:
     update_button: Any
 
 
-def market_browse_url(category: MarketCategory, *, is_isekai: bool) -> str:
-    if is_isekai and category not in ISEKAI_MARKET_CATEGORIES:
+def market_browse_url(category: MarketCategory, *, realm: Realm) -> str:
+    if not isinstance(realm, Realm):
+        raise TypeError("realm must be a Realm")
+    if realm is Realm.ISEKAI and category not in ISEKAI_MARKET_CATEGORIES:
         raise ValueError(f"{market_category_label(category)} is unavailable in Isekai")
-    root = ISEKAI_MARKET_ROOT_URL if is_isekai else MARKET_ROOT_URL
+    root = ISEKAI_MARKET_ROOT_URL if realm is Realm.ISEKAI else MARKET_ROOT_URL
     return f"{root}?s=Bazaar&ss=mk&screen=browseitems&filter={category.value}"
 
 
-def market_item_url(category: MarketCategory, item_id: int, *, is_isekai: bool) -> str:
-    return f"{market_browse_url(category, is_isekai=is_isekai)}&itemid={item_id}"
+def market_item_url(category: MarketCategory, item_id: int, *, realm: Realm) -> str:
+    return f"{market_browse_url(category, realm=realm)}&itemid={item_id}"
 
 
 def market_category_label(category: MarketCategory) -> str:
@@ -171,29 +195,33 @@ def parse_market_sell_order_id(onclick: str) -> int:
 class MarketClient:
     """Market inspection, explicit sale planning, and verified submission."""
 
-    def __init__(self, driver: _MarketDriver) -> None:
+    def __init__(self, driver: _MarketDriver, realm: RealmNavigator) -> None:
         self._driver = driver
+        self._realm = realm
 
-    async def inspect(self, *, is_isekai: bool) -> MarketSnapshot:
+    async def inspect(self) -> MarketSnapshot:
+        realm = await self._realm.current()
         categories = (
-            ISEKAI_MARKET_CATEGORIES if is_isekai else PERSISTENT_MARKET_CATEGORIES
+            ISEKAI_MARKET_CATEGORIES
+            if realm is Realm.ISEKAI
+            else PERSISTENT_MARKET_CATEGORIES
         )
         items: list[MarketItem] = []
         for category in categories:
-            items.extend(await self._inspect_category(category, is_isekai=is_isekai))
-        return MarketSnapshot(is_isekai=is_isekai, items=tuple(items))
+            items.extend(await self._inspect_category(category, realm=realm))
+        return MarketSnapshot(realm=realm, items=tuple(items))
 
     async def plan_sales(
         self,
-        requested_names: Mapping[MarketCategory, Collection[str]],
-        *,
-        is_isekai: bool,
+        request: MarketSaleRequest,
     ) -> MarketSalePlan:
         """Select stocked inventory without changing Market state."""
-        snapshot = await self.inspect(is_isekai=is_isekai)
+        if not isinstance(request, MarketSaleRequest):
+            raise TypeError("request must be a MarketSaleRequest")
+        snapshot = await self.inspect()
         normalized_requests = {
             category: {name.casefold() for name in names}
-            for category, names in requested_names.items()
+            for category, names in request.names_by_category().items()
         }
         selected = tuple(
             item
@@ -201,18 +229,18 @@ class MarketClient:
             if item.stock > 0
             and item.name.casefold() in normalized_requests.get(item.category, set())
         )
-        return MarketSalePlan(is_isekai=is_isekai, items=selected)
+        return MarketSalePlan(realm=snapshot.realm, items=selected)
 
     async def validate_sale_forms(self, plan: MarketSalePlan) -> None:
         """Verify every planned item form without clicking or submitting it."""
         for item in plan.items:
-            await self.inspect_sale_quote(item, is_isekai=plan.is_isekai)
+            await self.inspect_sale_quote(item, realm=plan.realm)
 
     async def inspect_sale_quote(
-        self, item: MarketItem, *, is_isekai: bool
+        self, item: MarketItem, *, realm: Realm
     ) -> MarketSaleQuote:
         """Inspect the current sell-side pricing source without clicking it."""
-        sale_form = await self._open_sale_form(item, is_isekai=is_isekai)
+        sale_form = await self._open_sale_form(item, realm=realm)
         return MarketSaleQuote(
             item=item,
             sell_order_id=sale_form.sell_order_id,
@@ -238,7 +266,7 @@ class MarketClient:
         """Execute the guarded submission algorithm after live verification."""
         sales: list[MarketSale] = []
         for item in plan.items:
-            sale_form = await self._open_sale_form(item, is_isekai=plan.is_isekai)
+            sale_form = await self._open_sale_form(item, realm=plan.realm)
             if sale_form.current_stock != item.stock:
                 raise MarketSubmissionError(
                     f"Market sale plan is stale for {item.name!r}: "
@@ -252,20 +280,18 @@ class MarketClient:
             await self._driver.page.wait(1)
             await self._raise_for_submission_error(item)
 
-            remaining_stock = await self._read_item_stock(
-                item, is_isekai=plan.is_isekai
-            )
+            remaining_stock = await self._read_item_stock(item, realm=plan.realm)
             if remaining_stock != 0:
                 raise MarketSubmissionError(
                     f"Market did not sell all planned stock for {item.name!r}: "
                     f"before={item.stock}, after={remaining_stock}"
                 )
             sales.append(MarketSale(item=item, remaining_stock=remaining_stock))
-        return MarketSaleReport(is_isekai=plan.is_isekai, sales=tuple(sales))
+        return MarketSaleReport(realm=plan.realm, sales=tuple(sales))
 
-    async def _open_sale_form(self, item: MarketItem, *, is_isekai: bool) -> _SaleForm:
+    async def _open_sale_form(self, item: MarketItem, *, realm: Realm) -> _SaleForm:
         await self._driver.get(
-            market_item_url(item.category, item.item_id, is_isekai=is_isekai)
+            market_item_url(item.category, item.item_id, realm=realm)
         )
         try:
             sell_order_cells = await self._driver.page.xpath(
@@ -296,9 +322,9 @@ class MarketClient:
             update_button=update_button,
         )
 
-    async def _read_item_stock(self, item: MarketItem, *, is_isekai: bool) -> int:
+    async def _read_item_stock(self, item: MarketItem, *, realm: Realm) -> int:
         await self._driver.get(
-            market_item_url(item.category, item.item_id, is_isekai=is_isekai)
+            market_item_url(item.category, item.item_id, realm=realm)
         )
         try:
             stock_control = await self._driver.page.select(
@@ -331,9 +357,9 @@ class MarketClient:
         raise MarketSubmissionError(f"Market rejected {item.name!r}: {message}")
 
     async def _inspect_category(
-        self, category: MarketCategory, *, is_isekai: bool
+        self, category: MarketCategory, *, realm: Realm
     ) -> list[MarketItem]:
-        await self._driver.get(market_browse_url(category, is_isekai=is_isekai))
+        await self._driver.get(market_browse_url(category, realm=realm))
         try:
             item_list = await self._driver.page.select("#market_itemlist", timeout=5)
         except TimeoutError as error:

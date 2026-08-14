@@ -10,8 +10,9 @@ from typing import Any, Protocol
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
-    select_bazaar_for_maintenance,
+    MaintenanceNavigator,
 )
+from .realm import Realm
 from .runtime import setup_logger
 
 logger = setup_logger(__name__)
@@ -52,8 +53,6 @@ class MonsterLabSubmissionError(RuntimeError):
 class _MonsterLabDriver(Protocol):
     page: Any
 
-    async def gohomepage(self, force: bool = False) -> None: ...
-
 
 class MonsterLabClient:
     """Inspect Monster Lab and invoke one explicit feed-all resource."""
@@ -61,6 +60,7 @@ class MonsterLabClient:
     def __init__(
         self,
         driver: _MonsterLabDriver,
+        navigation: MaintenanceNavigator,
         *,
         confirmation_checks: int = 5,
         confirmation_interval: float = 1,
@@ -79,6 +79,7 @@ class MonsterLabClient:
         ):
             raise ValueError("confirmation_interval must be a finite positive number")
         self.driver = driver
+        self.navigation = navigation
         self.confirmation_checks = confirmation_checks
         self.confirmation_interval = confirmation_interval
         self._sleep = sleep
@@ -164,7 +165,10 @@ class MonsterLabClient:
 
     async def _navigate(self) -> None:
         try:
-            bazaar = await select_bazaar_for_maintenance(self.driver)
+            bazaar = await self.navigation.select_bazaar(
+                Realm.PERSISTENT,
+                navigate_first=True,
+            )
         except MaintenanceNavigationBlockedError:
             raise
         except Exception as error:

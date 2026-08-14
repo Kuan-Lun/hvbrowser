@@ -1,15 +1,14 @@
 import unittest
-from types import SimpleNamespace
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock
 
 from hvbrowser import (
-    HVDriver,
+    MaintenanceNavigator,
     MonsterLabClient,
     MonsterLabFeed,
-    MonsterLabFeedReport,
     MonsterLabPageError,
     MonsterLabSnapshot,
     MonsterLabSubmissionError,
+    RealmNavigator,
 )
 
 
@@ -102,26 +101,44 @@ class _FakeMonsterLabDriver:
         self.homepage_calls.append(force)
 
 
+def _client(
+    driver: _FakeMonsterLabDriver,
+    *,
+    confirmation_checks: int = 5,
+    confirmation_interval: float = 1,
+    sleep=_no_sleep,
+) -> MonsterLabClient:
+    realm = RealmNavigator(driver)
+    navigation = MaintenanceNavigator(driver, realm)
+    return MonsterLabClient(
+        driver,
+        navigation,
+        confirmation_checks=confirmation_checks,
+        confirmation_interval=confirmation_interval,
+        sleep=sleep,
+    )
+
+
 class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
     def test_constructor_rejects_invalid_confirmation_settings(self) -> None:
         driver = _FakeMonsterLabDriver(_FakeMonsterLabPage())
 
         with self.assertRaisesRegex(ValueError, "at least 2"):
-            MonsterLabClient(driver, confirmation_checks=0)
+            _client(driver, confirmation_checks=0)
         with self.assertRaisesRegex(ValueError, "at least 2"):
-            MonsterLabClient(driver, confirmation_checks=1)
+            _client(driver, confirmation_checks=1)
         with self.assertRaisesRegex(ValueError, "at least 2"):
-            MonsterLabClient(driver, confirmation_checks=True)
+            _client(driver, confirmation_checks=True)
         with self.assertRaisesRegex(ValueError, "positive"):
-            MonsterLabClient(driver, confirmation_interval=-0.1)
+            _client(driver, confirmation_interval=-0.1)
         with self.assertRaisesRegex(ValueError, "positive"):
-            MonsterLabClient(driver, confirmation_interval=0)
+            _client(driver, confirmation_interval=0)
 
     async def test_inspect_is_read_only_and_reports_both_actions(self) -> None:
         page = _FakeMonsterLabPage(set(MonsterLabFeed))
         driver = _FakeMonsterLabDriver(page)
 
-        snapshot = await MonsterLabClient(driver).inspect()
+        snapshot = await _client(driver).inspect()
 
         self.assertEqual(
             snapshot,
@@ -132,30 +149,31 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.menu_entry.mouse_move_count, 1)
         self.assertEqual(page.menu_entry.mouse_click_count, 1)
         self.assertEqual(page.waited, [1])
-        self.assertEqual(len(page.evaluated), 2)
+        self.assertEqual(len(page.evaluated), 3)
         self.assertIn("riddlesubmit", page.evaluated[0])
-        self.assertEqual(page.evaluated[1], "typeof do_feed_all === 'function'")
+        self.assertIn("riddlesubmit", page.evaluated[1])
+        self.assertEqual(page.evaluated[2], "typeof do_feed_all === 'function'")
 
     async def test_inspect_fails_closed_when_page_api_is_missing(self) -> None:
         page = _FakeMonsterLabPage()
         page.has_api = False
 
         with self.assertRaisesRegex(MonsterLabPageError, "API is missing"):
-            await MonsterLabClient(_FakeMonsterLabDriver(page)).inspect()
+            await _client(_FakeMonsterLabDriver(page)).inspect()
 
     async def test_inspect_fails_closed_when_menu_is_missing(self) -> None:
         page = _FakeMonsterLabPage()
         page.has_menu_entry = False
 
         with self.assertRaisesRegex(MonsterLabPageError, "menu entry"):
-            await MonsterLabClient(_FakeMonsterLabDriver(page)).inspect()
+            await _client(_FakeMonsterLabDriver(page)).inspect()
 
     async def test_feed_all_returns_noop_without_submitting_when_unavailable(
         self,
     ) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.DRUGS})
 
-        report = await MonsterLabClient(
+        report = await _client(
             _FakeMonsterLabDriver(page),
             confirmation_interval=0.01,
             sleep=_no_sleep,
@@ -173,7 +191,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         page = _FakeMonsterLabPage(set(MonsterLabFeed))
 
         with self.assertLogs("hvbrowser.monster_lab", level="DEBUG") as captured:
-            report = await MonsterLabClient(
+            report = await _client(
                 _FakeMonsterLabDriver(page),
                 confirmation_checks=2,
                 confirmation_interval=0.01,
@@ -197,7 +215,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         page.submission_result = False
 
         with self.assertRaisesRegex(MonsterLabSubmissionError, "rejected"):
-            await MonsterLabClient(
+            await _client(
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
@@ -208,7 +226,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         page.submission_error = RuntimeError("disconnected")
 
         with self.assertRaisesRegex(MonsterLabSubmissionError, "outcome is unknown"):
-            await MonsterLabClient(
+            await _client(
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
@@ -219,7 +237,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         page.preserve_after_submit = True
 
         with self.assertRaisesRegex(MonsterLabSubmissionError, "Unable to confirm"):
-            await MonsterLabClient(
+            await _client(
                 _FakeMonsterLabDriver(page),
                 confirmation_checks=2,
                 confirmation_interval=0.01,
@@ -230,7 +248,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
-        client = MonsterLabClient(
+        client = _client(
             _FakeMonsterLabDriver(page),
             confirmation_checks=2,
             confirmation_interval=0.01,
@@ -250,7 +268,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_error_breaks_consecutive_absence_confirmation(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
-        client = MonsterLabClient(
+        client = _client(
             _FakeMonsterLabDriver(page),
             confirmation_checks=3,
             confirmation_interval=0.01,
@@ -273,7 +291,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
-        client = MonsterLabClient(
+        client = _client(
             _FakeMonsterLabDriver(page),
             confirmation_checks=3,
             confirmation_interval=0.01,
@@ -309,7 +327,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(
             MonsterLabSubmissionError, "Unable to confirm"
         ) as raised:
-            await MonsterLabClient(
+            await _client(
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=broken_sleep,
@@ -321,81 +339,9 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         driver = _FakeMonsterLabDriver(_FakeMonsterLabPage())
 
         with self.assertRaisesRegex(TypeError, "MonsterLabFeed"):
-            await MonsterLabClient(driver).feed_all("food")  # type: ignore[arg-type]
+            await _client(driver).feed_all("food")  # type: ignore[arg-type]
 
         self.assertEqual(driver.homepage_calls, [])
-
-    async def test_compatibility_workflow_applies_food_then_drugs(self) -> None:
-        driver = object.__new__(HVDriver)
-        before = MonsterLabSnapshot(frozenset(MonsterLabFeed))
-        after_food = MonsterLabSnapshot(frozenset({MonsterLabFeed.DRUGS}))
-        after_drugs = MonsterLabSnapshot(frozenset())
-        client = SimpleNamespace(
-            feed_all=AsyncMock(
-                side_effect=[
-                    MonsterLabFeedReport(
-                        MonsterLabFeed.FOOD,
-                        True,
-                        before,
-                        after_food,
-                    ),
-                    MonsterLabFeedReport(
-                        MonsterLabFeed.DRUGS,
-                        True,
-                        after_food,
-                        after_drugs,
-                    ),
-                ]
-            )
-        )
-
-        with (
-            patch("hvbrowser.hv.MonsterLabClient", return_value=client),
-            patch("hvbrowser.hv.logger.debug") as debug,
-            patch("hvbrowser.hv.logger.info") as info,
-        ):
-            await HVDriver.monstercheck(driver)
-
-        debug.assert_called_once_with("Starting monster check")
-        self.assertEqual(
-            info.call_args_list,
-            [
-                unittest.mock.call(
-                    "Monster check completed: resource=%s outcome=fed-all",
-                    MonsterLabFeed.FOOD.value,
-                ),
-                unittest.mock.call(
-                    "Monster check completed: resource=%s outcome=fed-all",
-                    MonsterLabFeed.DRUGS.value,
-                ),
-            ],
-        )
-        self.assertEqual(
-            client.feed_all.await_args_list,
-            [
-                unittest.mock.call(MonsterLabFeed.FOOD),
-                unittest.mock.call(MonsterLabFeed.DRUGS),
-            ],
-        )
-
-    async def test_hvdriver_exposes_explicit_monster_lab_operations(self) -> None:
-        driver = object.__new__(HVDriver)
-        before = MonsterLabSnapshot(frozenset({MonsterLabFeed.FOOD}))
-        after = MonsterLabSnapshot(frozenset())
-        report = MonsterLabFeedReport(MonsterLabFeed.FOOD, True, before, after)
-        client = SimpleNamespace(
-            inspect=AsyncMock(return_value=before),
-            feed_all=AsyncMock(return_value=report),
-        )
-
-        with patch("hvbrowser.hv.MonsterLabClient", return_value=client):
-            inspected = await HVDriver.inspect_monster_lab(driver)
-            fed = await HVDriver.feed_all_monsters(driver, MonsterLabFeed.FOOD)
-
-        self.assertIs(inspected, before)
-        self.assertIs(fed, report)
-        client.inspect.assert_awaited_once_with()
-        client.feed_all.assert_awaited_once_with(MonsterLabFeed.FOOD)
 
 
 if __name__ == "__main__":

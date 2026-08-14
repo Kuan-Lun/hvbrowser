@@ -12,6 +12,7 @@ from hvbrowser.market import (
     MarketPageError,
     MarketSalePlan,
     MarketSaleReport,
+    MarketSaleRequest,
     MarketSubmissionError,
     market_browse_url,
     market_item_url,
@@ -19,6 +20,7 @@ from hvbrowser.market import (
     parse_market_sell_order_id,
     parse_market_stock,
 )
+from hvbrowser.realm import Realm
 
 
 class _FakeElement:
@@ -140,21 +142,38 @@ class _FakeDriver:
         self.page.rows = rows.get(filter_code, [])
 
 
+class _FakeRealmNavigator:
+    def __init__(self, realm: Realm) -> None:
+        self.realm = realm
+        self.current_calls = 0
+
+    async def current(self) -> Realm:
+        self.current_calls += 1
+        return self.realm
+
+
+def _client(
+    driver: _FakeDriver,
+    realm: Realm = Realm.PERSISTENT,
+) -> MarketClient:
+    return MarketClient(driver, _FakeRealmNavigator(realm))  # type: ignore[arg-type]
+
+
 class MarketParsingTests(unittest.TestCase):
     def test_market_urls_are_realm_specific(self) -> None:
         self.assertEqual(
-            market_browse_url(MarketCategory.MATERIALS, is_isekai=False),
+            market_browse_url(MarketCategory.MATERIALS, realm=Realm.PERSISTENT),
             "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=ma",
         )
         self.assertEqual(
-            market_item_url(MarketCategory.MATERIALS, 123, is_isekai=True),
+            market_item_url(MarketCategory.MATERIALS, 123, realm=Realm.ISEKAI),
             "https://hentaiverse.org/isekai/"
             "?s=Bazaar&ss=mk&screen=browseitems&filter=ma&itemid=123",
         )
 
     def test_isekai_rejects_unavailable_category(self) -> None:
         with self.assertRaisesRegex(ValueError, "unavailable in Isekai"):
-            market_browse_url(MarketCategory.ARTIFACTS, is_isekai=True)
+            market_browse_url(MarketCategory.ARTIFACTS, realm=Realm.ISEKAI)
 
     def test_parse_item_id_from_supported_actions(self) -> None:
         self.assertEqual(parse_market_item_id("select_market_item(123)"), 123)
@@ -202,13 +221,13 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        snapshot = await MarketClient(driver).inspect(is_isekai=False)
+        snapshot = await _client(driver).inspect()
 
-        self.assertFalse(snapshot.is_isekai)
+        self.assertIs(snapshot.realm, Realm.PERSISTENT)
         self.assertEqual(
             driver.visited,
             [
-                market_browse_url(category, is_isekai=False)
+                market_browse_url(category, realm=Realm.PERSISTENT)
                 for category in PERSISTENT_MARKET_CATEGORIES
             ],
         )
@@ -223,13 +242,13 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_inspect_isekai_uses_only_available_categories(self) -> None:
         driver = _FakeDriver({})
 
-        snapshot = await MarketClient(driver).inspect(is_isekai=True)
+        snapshot = await _client(driver, Realm.ISEKAI).inspect()
 
-        self.assertTrue(snapshot.is_isekai)
+        self.assertIs(snapshot.realm, Realm.ISEKAI)
         self.assertEqual(
             driver.visited,
             [
-                market_browse_url(category, is_isekai=True)
+                market_browse_url(category, realm=Realm.ISEKAI)
                 for category in ISEKAI_MARKET_CATEGORIES
             ],
         )
@@ -245,7 +264,7 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
         driver.page.fail_market_root = True
 
         with self.assertRaisesRegex(MarketPageError, "Market item list is missing"):
-            await MarketClient(driver).inspect(is_isekai=False)
+            await _client(driver).inspect()
 
     async def test_plan_sales_is_read_only_and_ignores_empty_stock(self) -> None:
         driver = _FakeDriver(
@@ -257,11 +276,13 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
             }
         )
 
-        plan = await MarketClient(driver).plan_sales(
-            {MarketCategory.CONSUMABLES: ["health draught", "Mana Draught"]},
-            is_isekai=False,
+        plan = await _client(driver).plan_sales(
+            MarketSaleRequest(
+                consumables=("health draught", "Mana Draught"),
+            )
         )
 
+        self.assertIs(plan.realm, Realm.PERSISTENT)
         self.assertEqual([item.item_id for item in plan.items], [101])
         self.assertEqual(plan.total_units, 15)
         self.assertEqual(driver.page.stock_control.click_count, 0)
@@ -270,13 +291,19 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_validate_sale_forms_does_not_click_or_evaluate(self) -> None:
         driver = _FakeDriver({})
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-        plan = MarketSalePlan(is_isekai=False, items=(item,))
+        plan = MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
 
-        await MarketClient(driver).validate_sale_forms(plan)
+        await _client(driver).validate_sale_forms(plan)
 
         self.assertEqual(
             driver.visited,
-            [market_item_url(MarketCategory.CONSUMABLES, 101, is_isekai=False)],
+            [
+                market_item_url(
+                    MarketCategory.CONSUMABLES,
+                    101,
+                    realm=Realm.PERSISTENT,
+                )
+            ],
         )
         self.assertEqual(driver.page.stock_control.click_count, 0)
         self.assertEqual(driver.page.update_button.click_count, 0)
@@ -288,8 +315,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
         with self.assertRaisesRegex(MarketPageError, "no existing sell order"):
-            await MarketClient(driver).validate_sale_forms(
-                MarketSalePlan(is_isekai=False, items=(item,))
+            await _client(driver).validate_sale_forms(
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
             )
 
     async def test_submit_uses_verified_selectors_and_confirms_stock(self) -> None:
@@ -300,7 +327,7 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
         report = await self._submit_with_verified_live_semantics(
-            MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+            _client(driver), MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
         )
 
         self.assertEqual(report.sales[0].remaining_stock, 0)
@@ -319,7 +346,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(MarketSubmissionError, "Insufficient stock"):
             await self._submit_with_verified_live_semantics(
-                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
 
     async def test_submit_rejects_unchanged_stock(self) -> None:
@@ -329,7 +357,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(MarketSubmissionError, "did not sell all"):
             await self._submit_with_verified_live_semantics(
-                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
 
     async def test_submit_rejects_missing_post_submit_item(self) -> None:
@@ -339,7 +368,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(MarketSubmissionError, "confirmation is missing"):
             await self._submit_with_verified_live_semantics(
-                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
 
     async def test_submit_rejects_blank_stock_confirmation(self) -> None:
@@ -349,7 +379,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(MarketSubmissionError, "confirmation is blank"):
             await self._submit_with_verified_live_semantics(
-                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
 
     async def test_submit_rejects_stale_plan_before_click(self) -> None:
@@ -359,7 +390,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(MarketSubmissionError, "plan is stale"):
             await self._submit_with_verified_live_semantics(
-                MarketClient(driver), MarketSalePlan(is_isekai=False, items=(item,))
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
 
         self.assertEqual(driver.page.stock_control.click_count, 0)
@@ -372,8 +404,8 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
         with self.assertRaisesRegex(MarketSubmissionError, "submission is disabled"):
-            await MarketClient(driver).submit_sales(
-                MarketSalePlan(is_isekai=False, items=(item,))
+            await _client(driver).submit_sales(
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
             )
 
         self.assertEqual(driver.visited, [])
