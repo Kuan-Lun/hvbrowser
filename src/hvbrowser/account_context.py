@@ -1,15 +1,15 @@
 """One authenticated browser context with realm-bound HentaiVerse runtimes.
 
-The account context owns the browser lifecycle.  Persistent and Isekai each
-receive one immutable browser target and one driver that can never be switched
-to the other target.  Higher layers retain campaign and scheduling policy; this
-module only establishes and enforces the browser/realm ownership boundary.
+The account context owns the browser lifecycle.  Each enabled realm receives
+one immutable browser target and one driver that can never be switched to the
+other target.  Higher layers retain campaign and scheduling policy; this module
+only establishes and enforces the browser/realm ownership boundary.
 """
 
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from enum import StrEnum
 from functools import partial
 from typing import Any, Self, cast
@@ -52,6 +52,10 @@ class RealmTabBindingError(AccountContextError):
 
 class RealmBindingViolationError(AccountContextError):
     """A completed realm operation left its tab in another realm."""
+
+
+class RealmNotEnabledError(AccountContextError):
+    """A caller requested a runtime that this context did not enable."""
 
 
 class AccountContextState(StrEnum):
@@ -334,7 +338,12 @@ class RealmRuntime[TabT]:
 
 
 class HentaiVerseAccountContext[BrowserT, TabT]:
-    """Own one authenticated browser and two fixed HentaiVerse realm tabs."""
+    """Own one authenticated browser and its enabled realm runtimes.
+
+    Authentication always uses the browser factory's Persistent main tab.  An
+    Isekai-only context retains that tab as a private authentication bootstrap,
+    while exposing only the requested Isekai runtime.
+    """
 
     def __init__(
         self,
@@ -349,7 +358,15 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         current_url_reader: CurrentUrlReader[TabT] | None = None,
         driver_factory: BoundDriverFactory[TabT] | None = None,
         owner_id: str | None = None,
+        enabled_realms: Collection[Realm] = tuple(Realm),
     ) -> None:
+        requested_realms = tuple(enabled_realms)
+        if not requested_realms:
+            raise ValueError("enabled_realms must contain at least one realm")
+        if not all(isinstance(realm, Realm) for realm in requested_realms):
+            raise TypeError("enabled_realms entries must be Realm values")
+        self._enabled_realms = frozenset(requested_realms)
+
         default_browser_factory = partial(create_browser, headless=headless)
         resolved_browser_factory = browser_factory or cast(
             BrowserFactory[BrowserT, TabT],
@@ -386,8 +403,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                 headless=headless,
             ),
         )
-        self._persistent: RealmRuntime[TabT] | None = None
-        self._isekai: RealmRuntime[TabT] | None = None
+        self._runtimes: dict[Realm, RealmRuntime[TabT]] = {}
         self._state = AccountContextState.NEW
         self._lifecycle_lock = asyncio.Lock()
 
@@ -399,6 +415,12 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
     def owner(self) -> BrowserOwner[BrowserT, TabT]:
         return self._owner
 
+    @property
+    def enabled_realms(self) -> frozenset[Realm]:
+        """The realm runtimes this context will expose after startup."""
+
+        return self._enabled_realms
+
     def _require_open(self) -> None:
         if self._state is not AccountContextState.OPEN:
             raise AccountContextStateError(
@@ -407,24 +429,24 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
 
     @property
     def persistent(self) -> RealmRuntime[TabT]:
-        self._require_open()
-        assert self._persistent is not None
-        return self._persistent
+        return self.runtime(Realm.PERSISTENT)
 
     @property
     def isekai(self) -> RealmRuntime[TabT]:
-        self._require_open()
-        assert self._isekai is not None
-        return self._isekai
+        return self.runtime(Realm.ISEKAI)
 
     def runtime(self, realm: Realm) -> RealmRuntime[TabT]:
         """Return the fixed runtime for ``realm``."""
 
         if not isinstance(realm, Realm):
             raise TypeError("realm must be a Realm")
-        if realm is Realm.ISEKAI:
-            return self.isekai
-        return self.persistent
+        self._require_open()
+        try:
+            return self._runtimes[realm]
+        except KeyError:
+            raise RealmNotEnabledError(
+                f"the {realm.value} realm is not enabled for this account context"
+            ) from None
 
     async def _bind_runtime(
         self,
@@ -446,7 +468,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         )
 
     async def start(self) -> Self:
-        """Start, authenticate once, and establish both realm tabs."""
+        """Start, authenticate once, and establish the enabled realm tabs."""
 
         async with self._lifecycle_lock:
             if self._state is AccountContextState.OPEN:
@@ -458,15 +480,20 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
 
             try:
                 await self._owner.start()
-                persistent = await self._bind_runtime(
+                authentication_runtime = await self._bind_runtime(
                     Realm.PERSISTENT,
                     self._owner.main_tab,
                 )
-                await persistent._authenticate(self._authenticator)
+                await authentication_runtime._authenticate(self._authenticator)
 
-                isekai_transport = await self._owner.open_tab(Realm.ISEKAI.value)
-                isekai = await self._bind_runtime(Realm.ISEKAI, isekai_transport)
-                await isekai._establish()
+                runtimes: dict[Realm, RealmRuntime[TabT]] = {}
+                if Realm.PERSISTENT in self._enabled_realms:
+                    runtimes[Realm.PERSISTENT] = authentication_runtime
+                if Realm.ISEKAI in self._enabled_realms:
+                    isekai_transport = await self._owner.open_tab(Realm.ISEKAI.value)
+                    isekai = await self._bind_runtime(Realm.ISEKAI, isekai_transport)
+                    await isekai._establish()
+                    runtimes[Realm.ISEKAI] = isekai
             except BaseException as startup_error:
                 try:
                     await self._owner.close()
@@ -478,8 +505,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                 self._state = AccountContextState.CLOSED
                 raise
 
-            self._persistent = persistent
-            self._isekai = isekai
+            self._runtimes = runtimes
             self._state = AccountContextState.OPEN
             return self
 
@@ -517,6 +543,7 @@ __all__ = [
     "HentaiVerseAccountContext",
     "RealmBindingViolationError",
     "RealmBoundHVDriver",
+    "RealmNotEnabledError",
     "RealmRuntime",
     "RealmTabBindingError",
     "realm_root_url",

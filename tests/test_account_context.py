@@ -1,5 +1,5 @@
 import unittest
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock
 
@@ -9,6 +9,7 @@ from hvbrowser.account_context import (
     HentaiVerseAccountContext,
     RealmBindingViolationError,
     RealmBoundHVDriver,
+    RealmNotEnabledError,
     RealmTabBindingError,
 )
 from hvbrowser.realm import Realm
@@ -20,6 +21,7 @@ class _FakeTab:
     target_id: str
     url: str = "about:blank"
     navigations: list[str] = field(default_factory=list)
+    opened: bool = False
 
     async def evaluate(self, script: str) -> str:
         if script != "window.location.href":
@@ -41,6 +43,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         self,
         *,
         authenticator: Callable[[RealmBoundHVDriver], Awaitable[None]] | None = None,
+        enabled_realms: Collection[Realm] = tuple(Realm),
     ) -> tuple[
         HentaiVerseAccountContext[_FakeBrowser, _FakeTab],
         _FakeBrowser,
@@ -59,6 +62,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             return browser, persistent_tab
 
         async def open_tab(_: _FakeBrowser) -> _FakeTab:
+            isekai_tab.opened = True
             return isekai_tab
 
         async def navigate(tab: _FakeTab, url: str) -> None:
@@ -76,6 +80,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             tab_factory=open_tab,
             tab_navigator=navigate,
             target_id_getter=lambda tab: tab.target_id,
+            enabled_realms=enabled_realms,
         )
         return (
             context,
@@ -119,6 +124,58 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.state, AccountContextState.CLOSED)
         browser_closer.assert_awaited_once()
+
+    async def test_persistent_only_does_not_open_an_isekai_tab(self) -> None:
+        (
+            context,
+            _,
+            persistent_tab,
+            isekai_tab,
+            browser_closer,
+            authentication_targets,
+        ) = self._context(enabled_realms=(Realm.PERSISTENT,))
+
+        async with context:
+            self.assertEqual(context.enabled_realms, frozenset({Realm.PERSISTENT}))
+            self.assertEqual(authentication_targets, ["persistent-target"])
+            self.assertIs(context.persistent.driver.page, persistent_tab)
+            self.assertFalse(isekai_tab.opened)
+            self.assertEqual(len(context.owner.tabs), 1)
+            with self.assertRaisesRegex(RealmNotEnabledError, "isekai"):
+                _ = context.isekai
+
+        browser_closer.assert_awaited_once()
+
+    async def test_isekai_only_uses_a_private_persistent_login_bootstrap(
+        self,
+    ) -> None:
+        (
+            context,
+            _,
+            persistent_tab,
+            isekai_tab,
+            browser_closer,
+            authentication_targets,
+        ) = self._context(enabled_realms=(Realm.ISEKAI,))
+
+        async with context:
+            self.assertEqual(context.enabled_realms, frozenset({Realm.ISEKAI}))
+            self.assertEqual(authentication_targets, ["persistent-target"])
+            self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
+            self.assertTrue(isekai_tab.opened)
+            self.assertIs(context.isekai.driver.page, isekai_tab)
+            self.assertEqual(isekai_tab.url, HENTAIVERSE_ISEKAI_ROOT_URL)
+            self.assertEqual(len(context.owner.tabs), 2)
+            with self.assertRaisesRegex(RealmNotEnabledError, "persistent"):
+                context.runtime(Realm.PERSISTENT)
+
+        browser_closer.assert_awaited_once()
+
+    def test_enabled_realms_must_be_non_empty_realm_values(self) -> None:
+        with self.assertRaisesRegex(ValueError, "at least one realm"):
+            self._context(enabled_realms=())
+        with self.assertRaisesRegex(TypeError, "Realm values"):
+            self._context(enabled_realms=("persistent",))  # type: ignore[arg-type]
 
     async def test_runtime_does_not_follow_browser_current_tab(self) -> None:
         context, browser, persistent_tab, isekai_tab, _, _ = self._context()
