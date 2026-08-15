@@ -1,5 +1,16 @@
 """Public HentaiVerse browser composition API."""
 
+from .account_context import (
+    AccountContextError,
+    AccountContextState,
+    AccountContextStateError,
+    HentaiVerseAccountContext,
+    RealmBindingViolationError,
+    RealmBoundHVDriver,
+    RealmRuntime,
+    RealmTabBindingError,
+    realm_root_url,
+)
 from .equipment_repair import (
     EquipmentRepairClient,
     EquipmentRepairOutcome,
@@ -61,6 +72,9 @@ from .session import HentaiVerseSession
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 __all__ = [
+    "AccountContextError",
+    "AccountContextState",
+    "AccountContextStateError",
     "EquipmentRepairClient",
     "EquipmentRepairOutcome",
     "EquipmentRepairPageError",
@@ -71,6 +85,7 @@ __all__ = [
     "HENTAIVERSE_ISEKAI_ROOT_URL",
     "HENTAIVERSE_ROOT_URL",
     "HVDriver",
+    "HentaiVerseAccountContext",
     "HentaiVerseSession",
     "LOTTERY_TICKET_PRICE_GP",
     "LotteryClient",
@@ -105,11 +120,16 @@ __all__ = [
     "PlayerSnapshot",
     "PlayerStateChangedError",
     "Realm",
+    "RealmBindingViolationError",
+    "RealmBoundHVDriver",
     "RealmDetectionError",
     "RealmNavigator",
+    "RealmRuntime",
+    "RealmTabBindingError",
     "StaminaRecoveryError",
     "StaminaRecoveryOutcome",
     "StaminaRecoveryReport",
     "classify_maintenance_navigation_blocker",
     "realm_from_url",
+    "realm_root_url",
 ]
