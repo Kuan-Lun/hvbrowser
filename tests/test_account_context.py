@@ -1,7 +1,9 @@
 import unittest
-from collections.abc import Awaitable, Callable, Collection
+from collections.abc import Awaitable, Callable, Collection, Iterator
+from contextlib import contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass, field
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser.account_context import (
     AccountContextState,
@@ -10,9 +12,11 @@ from hvbrowser.account_context import (
     RealmBindingViolationError,
     RealmBoundHVDriver,
     RealmNotEnabledError,
+    RealmRuntime,
     RealmTabBindingError,
 )
 from hvbrowser.realm import Realm
+from hvbrowser.runtime import log_context
 from hvbrowser.urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 
@@ -38,12 +42,58 @@ class _FakeBrowser:
     current_tab: _FakeTab
 
 
+class _RecordingLogContext:
+    """Test double with the nesting semantics of hbrowser.log_context."""
+
+    def __init__(self) -> None:
+        self._active: ContextVar[dict[str, str]] = ContextVar(
+            "test_log_context",
+            default={},
+        )
+        self.entered: list[dict[str, str]] = []
+
+    @property
+    def current(self) -> dict[str, str]:
+        return dict(self._active.get())
+
+    @contextmanager
+    def __call__(
+        self,
+        *,
+        account: str | None = None,
+        realm: str | None = None,
+        tab_role: str | None = None,
+        activity: str | None = None,
+        scope: str | None = None,
+    ) -> Iterator[None]:
+        supplied = {
+            "account": account,
+            "realm": realm,
+            "tab_role": tab_role,
+            "activity": activity,
+            "scope": scope,
+        }
+        merged = self.current
+        merged.update(
+            (field_name, value)
+            for field_name, value in supplied.items()
+            if value is not None
+        )
+        self.entered.append(merged)
+        token = self._active.set(merged)
+        try:
+            yield
+        finally:
+            self._active.reset(token)
+
+
 class AccountContextTests(unittest.IsolatedAsyncioTestCase):
     def _context(
         self,
         *,
         authenticator: Callable[[RealmBoundHVDriver], Awaitable[None]] | None = None,
         enabled_realms: Collection[Realm] = tuple(Realm),
+        account_label: str | None = None,
     ) -> tuple[
         HentaiVerseAccountContext[_FakeBrowser, _FakeTab],
         _FakeBrowser,
@@ -81,6 +131,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             tab_navigator=navigate,
             target_id_getter=lambda tab: tab.target_id,
             enabled_realms=enabled_realms,
+            account_label=account_label,
         )
         return (
             context,
@@ -176,6 +227,153 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             self._context(enabled_realms=())
         with self.assertRaisesRegex(TypeError, "Realm values"):
             self._context(enabled_realms=("persistent",))  # type: ignore[arg-type]
+
+    def test_account_label_is_optional_and_normalized(self) -> None:
+        context, *_ = self._context(account_label="  main  ")
+
+        self.assertEqual(context.account_label, "main")
+        self.assertIsNone(self._context()[0].account_label)
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            self._context(account_label="  ")
+        with self.assertRaisesRegex(TypeError, "string or None"):
+            self._context(account_label=object())  # type: ignore[arg-type]
+
+    async def test_runtime_account_label_is_validated_and_normalized(self) -> None:
+        context, *_ = self._context()
+        await context.start()
+        self.addAsyncCleanup(context.close)
+        persistent = context.persistent
+
+        async def read_url(tab: _FakeTab) -> object:
+            return await tab.evaluate("window.location.href")
+
+        runtime = RealmRuntime(
+            realm=Realm.PERSISTENT,
+            transport=persistent.transport,
+            driver=persistent.driver,
+            current_url_reader=read_url,
+            account_label="  alt  ",
+        )
+        self.assertEqual(runtime.account_label, "alt")
+
+        with self.assertRaisesRegex(ValueError, "must not be empty"):
+            RealmRuntime(
+                realm=Realm.PERSISTENT,
+                transport=persistent.transport,
+                driver=persistent.driver,
+                current_url_reader=read_url,
+                account_label="  ",
+            )
+        with self.assertRaisesRegex(TypeError, "string or None"):
+            RealmRuntime(
+                realm=Realm.PERSISTENT,
+                transport=persistent.transport,
+                driver=persistent.driver,
+                current_url_reader=read_url,
+                account_label=object(),  # type: ignore[arg-type]
+            )
+
+    async def test_startup_sets_browser_login_and_establishment_contexts(
+        self,
+    ) -> None:
+        context, *_ = self._context(account_label="main")
+        recorder = _RecordingLogContext()
+
+        with patch("hvbrowser.account_context.log_context", new=recorder):
+            await context.start()
+        self.addAsyncCleanup(context.close)
+
+        self.assertEqual(context.persistent.account_label, "main")
+        self.assertEqual(context.isekai.account_label, "main")
+        self.assertIn(
+            {"account": "main", "scope": "Browser"},
+            recorder.entered,
+        )
+        self.assertIn(
+            {
+                "account": "main",
+                "realm": "persistent",
+                "tab_role": "persistent",
+                "activity": "Login",
+            },
+            recorder.entered,
+        )
+        self.assertIn(
+            {
+                "account": "main",
+                "realm": "isekai",
+                "tab_role": "isekai",
+                "activity": "Establish",
+            },
+            recorder.entered,
+        )
+        self.assertEqual(recorder.current, {})
+
+    async def test_runtime_context_selects_realm_and_restores_ambient_values(
+        self,
+    ) -> None:
+        context, *_ = self._context(account_label="main")
+        await context.start()
+        self.addAsyncCleanup(context.close)
+        recorder = _RecordingLogContext()
+
+        with patch("hvbrowser.account_context.log_context", new=recorder):
+            with recorder(activity="Check-in"):
+                persistent_context = await context.persistent.execute(
+                    lambda _: _return(recorder.current)
+                )
+                self.assertEqual(recorder.current, {"activity": "Check-in"})
+
+            with recorder(activity="Battle"):
+                isekai_context = await context.isekai.execute(
+                    lambda _: _return(recorder.current)
+                )
+                self.assertEqual(recorder.current, {"activity": "Battle"})
+
+        self.assertEqual(
+            persistent_context,
+            {
+                "account": "main",
+                "realm": "persistent",
+                "tab_role": "persistent",
+                "activity": "Check-in",
+            },
+        )
+        self.assertEqual(
+            isekai_context,
+            {
+                "account": "main",
+                "realm": "isekai",
+                "tab_role": "isekai",
+                "activity": "Battle",
+            },
+        )
+        self.assertEqual(recorder.current, {})
+
+    async def test_navigation_overrides_activity_without_leaking_context(self) -> None:
+        context, *_ = self._context(account_label="main")
+        await context.start()
+        self.addAsyncCleanup(context.close)
+        recorder = _RecordingLogContext()
+
+        with patch("hvbrowser.account_context.log_context", new=recorder):
+            with recorder(activity="Battle"):
+                await context.isekai.navigate(HENTAIVERSE_ISEKAI_ROOT_URL)
+                self.assertEqual(recorder.current, {"activity": "Battle"})
+
+        self.assertIn(
+            {
+                "account": "main",
+                "realm": "isekai",
+                "tab_role": "isekai",
+                "activity": "Navigation",
+            },
+            recorder.entered,
+        )
+        self.assertEqual(recorder.current, {})
+
+    def test_runtime_reexports_log_context(self) -> None:
+        self.assertTrue(callable(log_context))
 
     async def test_runtime_does_not_follow_browser_current_tab(self) -> None:
         context, browser, persistent_tab, isekai_tab, _, _ = self._context()

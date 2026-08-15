@@ -29,6 +29,7 @@ from hbrowser.gallery.browser import (
 
 from .hv import HVDriver
 from .realm import Realm, RealmDetectionError, realm_from_url
+from .runtime import log_context
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 type AccountAuthenticator = Callable[[RealmBoundHVDriver], Awaitable[None]]
@@ -64,6 +65,17 @@ class AccountContextState(StrEnum):
     NEW = "new"
     OPEN = "open"
     CLOSED = "closed"
+
+
+def _normalize_account_label(account_label: str | None) -> str | None:
+    if account_label is None:
+        return None
+    if not isinstance(account_label, str):
+        raise TypeError("account_label must be a string or None")
+    normalized = account_label.strip()
+    if not normalized:
+        raise ValueError("account_label must not be empty")
+    return normalized
 
 
 def realm_root_url(realm: Realm) -> str:
@@ -181,6 +193,7 @@ class RealmRuntime[TabT]:
         transport: TabTransport[TabT],
         driver: RealmBoundHVDriver,
         current_url_reader: CurrentUrlReader[TabT],
+        account_label: str | None = None,
     ) -> None:
         if transport.role != realm.value:
             raise RealmTabBindingError(
@@ -197,11 +210,18 @@ class RealmRuntime[TabT]:
         self._transport = transport
         self._driver = driver
         self._current_url_reader = current_url_reader
+        self._account_label = _normalize_account_label(account_label)
         self._operation_lock = asyncio.Lock()
 
     @property
     def realm(self) -> Realm:
         return self._realm
+
+    @property
+    def account_label(self) -> str | None:
+        """The optional user-facing account label attached to runtime logs."""
+
+        return self._account_label
 
     @property
     def transport(self) -> TabTransport[TabT]:
@@ -218,7 +238,12 @@ class RealmRuntime[TabT]:
         return self._driver
 
     async def _read_current_url(self) -> object:
-        return await self._transport.execute(self._current_url_reader)
+        with log_context(
+            account=self._account_label,
+            realm=self._realm.value,
+            tab_role=self.tab_handle.role,
+        ):
+            return await self._transport.execute(self._current_url_reader)
 
     async def current_realm(self) -> Realm:
         """Inspect the realm currently displayed by the fixed tab."""
@@ -239,11 +264,16 @@ class RealmRuntime[TabT]:
     async def ensure_realm(self) -> None:
         """Restore this tab to its bound realm if it drifted elsewhere."""
 
-        async with self._operation_lock:
-            try:
-                await self._assert_current_realm()
-            except RealmDetectionError, RealmTabBindingError:
-                await self._navigate_home()
+        with log_context(
+            account=self._account_label,
+            realm=self._realm.value,
+            tab_role=self.tab_handle.role,
+        ):
+            async with self._operation_lock:
+                try:
+                    await self._assert_current_realm()
+                except RealmDetectionError, RealmTabBindingError:
+                    await self._navigate_home()
 
     async def _ensure_before_operation(self) -> None:
         try:
@@ -273,26 +303,31 @@ class RealmRuntime[TabT]:
     ) -> ResultT:
         """Run one operation against the fixed driver and verify its realm."""
 
-        async with self._operation_lock:
-            await self._ensure_before_operation()
+        with log_context(
+            account=self._account_label,
+            realm=self._realm.value,
+            tab_role=self.tab_handle.role,
+        ):
+            async with self._operation_lock:
+                await self._ensure_before_operation()
 
-            async def run(_: TabT) -> ResultT:
-                return await operation(self._driver)
+                async def run(_: TabT) -> ResultT:
+                    return await operation(self._driver)
 
-            try:
-                result = await self._transport.execute(run)
-            except BaseException as operation_error:
                 try:
-                    await self._restore_after_operation()
-                except RealmBindingViolationError as binding_error:
-                    operation_error.add_note(
-                        "the realm operation failed after leaving its bound realm; "
-                        f"the tab was restored ({type(binding_error).__name__})"
-                    )
-                raise
+                    result = await self._transport.execute(run)
+                except BaseException as operation_error:
+                    try:
+                        await self._restore_after_operation()
+                    except RealmBindingViolationError as binding_error:
+                        operation_error.add_note(
+                            "the realm operation failed after leaving its bound realm; "
+                            f"the tab was restored ({type(binding_error).__name__})"
+                        )
+                    raise
 
-            await self._restore_after_operation()
-            return result
+                await self._restore_after_operation()
+                return result
 
     async def navigate(self, url: str) -> None:
         """Navigate within this runtime's realm, rejecting cross-realm URLs."""
@@ -308,10 +343,16 @@ class RealmRuntime[TabT]:
                 f"{self._realm.value} runtime rejected a cross-realm destination"
             )
 
-        async with self._operation_lock:
-            await self._ensure_before_operation()
-            await self._transport.navigate(url)
-            await self._restore_after_operation()
+        with log_context(
+            account=self._account_label,
+            realm=self._realm.value,
+            tab_role=self.tab_handle.role,
+            activity="Navigation",
+        ):
+            async with self._operation_lock:
+                await self._ensure_before_operation()
+                await self._transport.navigate(url)
+                await self._restore_after_operation()
 
     async def go_home(self) -> None:
         """Navigate the fixed tab to its canonical realm root."""
@@ -324,17 +365,29 @@ class RealmRuntime[TabT]:
     ) -> None:
         """Run the one account login before normal realm checks are enabled."""
 
-        async with self._operation_lock:
+        with log_context(
+            account=self._account_label,
+            realm=Realm.PERSISTENT.value,
+            tab_role=self.tab_handle.role,
+            activity="Login",
+        ):
+            async with self._operation_lock:
 
-            async def authenticate(_: TabT) -> None:
-                await authenticator(self._driver)
+                async def authenticate(_: TabT) -> None:
+                    await authenticator(self._driver)
 
-            await self._transport.execute(authenticate)
-            await self._assert_current_realm()
+                await self._transport.execute(authenticate)
+                await self._assert_current_realm()
 
     async def _establish(self) -> None:
-        async with self._operation_lock:
-            await self._navigate_home()
+        with log_context(
+            account=self._account_label,
+            realm=self._realm.value,
+            tab_role=self.tab_handle.role,
+            activity="Establish",
+        ):
+            async with self._operation_lock:
+                await self._navigate_home()
 
 
 class HentaiVerseAccountContext[BrowserT, TabT]:
@@ -358,6 +411,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         current_url_reader: CurrentUrlReader[TabT] | None = None,
         driver_factory: BoundDriverFactory[TabT] | None = None,
         owner_id: str | None = None,
+        account_label: str | None = None,
         enabled_realms: Collection[Realm] = tuple(Realm),
     ) -> None:
         requested_realms = tuple(enabled_realms)
@@ -366,6 +420,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         if not all(isinstance(realm, Realm) for realm in requested_realms):
             raise TypeError("enabled_realms entries must be Realm values")
         self._enabled_realms = frozenset(requested_realms)
+        self._account_label = _normalize_account_label(account_label)
 
         default_browser_factory = partial(create_browser, headless=headless)
         resolved_browser_factory = browser_factory or cast(
@@ -421,6 +476,12 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
 
         return self._enabled_realms
 
+    @property
+    def account_label(self) -> str | None:
+        """The optional user-facing label attached to this account's logs."""
+
+        return self._account_label
+
     def _require_open(self) -> None:
         if self._state is not AccountContextState.OPEN:
             raise AccountContextStateError(
@@ -465,49 +526,57 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
             transport=transport,
             driver=driver,
             current_url_reader=self._current_url_reader,
+            account_label=self._account_label,
         )
 
     async def start(self) -> Self:
         """Start, authenticate once, and establish the enabled realm tabs."""
 
-        async with self._lifecycle_lock:
-            if self._state is AccountContextState.OPEN:
-                return self
-            if self._state is not AccountContextState.NEW:
-                raise AccountContextStateError(
-                    f"cannot start account context in {self._state.value!r} state"
-                )
-
-            try:
-                await self._owner.start()
-                authentication_runtime = await self._bind_runtime(
-                    Realm.PERSISTENT,
-                    self._owner.main_tab,
-                )
-                await authentication_runtime._authenticate(self._authenticator)
-
-                runtimes: dict[Realm, RealmRuntime[TabT]] = {}
-                if Realm.PERSISTENT in self._enabled_realms:
-                    runtimes[Realm.PERSISTENT] = authentication_runtime
-                if Realm.ISEKAI in self._enabled_realms:
-                    isekai_transport = await self._owner.open_tab(Realm.ISEKAI.value)
-                    isekai = await self._bind_runtime(Realm.ISEKAI, isekai_transport)
-                    await isekai._establish()
-                    runtimes[Realm.ISEKAI] = isekai
-            except BaseException as startup_error:
-                try:
-                    await self._owner.close()
-                except BaseException as cleanup_error:
-                    startup_error.add_note(
-                        "account browser cleanup also failed: "
-                        f"{type(cleanup_error).__name__}"
+        with log_context(account=self._account_label):
+            async with self._lifecycle_lock:
+                if self._state is AccountContextState.OPEN:
+                    return self
+                if self._state is not AccountContextState.NEW:
+                    raise AccountContextStateError(
+                        f"cannot start account context in {self._state.value!r} state"
                     )
-                self._state = AccountContextState.CLOSED
-                raise
 
-            self._runtimes = runtimes
-            self._state = AccountContextState.OPEN
-            return self
+                try:
+                    with log_context(scope="Browser"):
+                        await self._owner.start()
+                    authentication_runtime = await self._bind_runtime(
+                        Realm.PERSISTENT,
+                        self._owner.main_tab,
+                    )
+                    await authentication_runtime._authenticate(self._authenticator)
+
+                    runtimes: dict[Realm, RealmRuntime[TabT]] = {}
+                    if Realm.PERSISTENT in self._enabled_realms:
+                        runtimes[Realm.PERSISTENT] = authentication_runtime
+                    if Realm.ISEKAI in self._enabled_realms:
+                        isekai_transport = await self._owner.open_tab(
+                            Realm.ISEKAI.value
+                        )
+                        isekai = await self._bind_runtime(
+                            Realm.ISEKAI,
+                            isekai_transport,
+                        )
+                        await isekai._establish()
+                        runtimes[Realm.ISEKAI] = isekai
+                except BaseException as startup_error:
+                    try:
+                        await self._owner.close()
+                    except BaseException as cleanup_error:
+                        startup_error.add_note(
+                            "account browser cleanup also failed: "
+                            f"{type(cleanup_error).__name__}"
+                        )
+                    self._state = AccountContextState.CLOSED
+                    raise
+
+                self._runtimes = runtimes
+                self._state = AccountContextState.OPEN
+                return self
 
     async def close(self) -> None:
         """Close the single browser owner; bound drivers never close it."""
