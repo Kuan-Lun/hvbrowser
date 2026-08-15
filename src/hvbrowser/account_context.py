@@ -39,12 +39,20 @@ type BoundDriverFactory[TabT] = Callable[
 type CurrentUrlReader[TabT] = Callable[[TabT], Awaitable[object]]
 
 
+def _never_stop() -> bool:
+    return False
+
+
 class AccountContextError(RuntimeError):
     """Base error for account-context lifecycle and binding failures."""
 
 
 class AccountContextStateError(AccountContextError):
     """An account-context operation is invalid in the current state."""
+
+
+class AccountContextStartupStopped(AccountContextError):
+    """Account startup reached a safe boundary after a stop request."""
 
 
 class RealmTabBindingError(AccountContextError):
@@ -461,6 +469,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         self._runtimes: dict[Realm, RealmRuntime[TabT]] = {}
         self._state = AccountContextState.NEW
         self._lifecycle_lock = asyncio.Lock()
+        self._close_task: asyncio.Task[None] | None = None
 
     @property
     def state(self) -> AccountContextState:
@@ -529,8 +538,50 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
             account_label=self._account_label,
         )
 
-    async def start(self) -> Self:
+    @staticmethod
+    async def _raise_if_startup_stopped(
+        stop_requested: Callable[[], bool],
+    ) -> None:
+        await asyncio.sleep(0)
+        if stop_requested():
+            raise AccountContextStartupStopped
+
+    def _ensure_close_task(self) -> asyncio.Task[None]:
+        task = self._close_task
+        if task is None:
+            task = asyncio.create_task(self._owner.close())
+            self._close_task = task
+        return task
+
+    @staticmethod
+    async def _wait_for_close_task(
+        task: asyncio.Task[None],
+    ) -> tuple[BaseException | None, asyncio.CancelledError | None]:
+        """Wait for shared cleanup while postponing caller cancellation."""
+
+        delayed_cancellation: asyncio.CancelledError | None = None
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError as error:
+                if delayed_cancellation is None:
+                    delayed_cancellation = error
+
+        try:
+            task.result()
+        except BaseException as error:
+            return error, delayed_cancellation
+        return None, delayed_cancellation
+
+    async def start(
+        self,
+        *,
+        stop_requested: Callable[[], bool] = _never_stop,
+    ) -> Self:
         """Start, authenticate once, and establish the enabled realm tabs."""
+
+        if not callable(stop_requested):
+            raise TypeError("stop_requested must be callable")
 
         with log_context(account=self._account_label):
             async with self._lifecycle_lock:
@@ -542,36 +593,47 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                     )
 
                 try:
+                    await self._raise_if_startup_stopped(stop_requested)
                     with log_context(scope="Browser"):
                         await self._owner.start()
+                    await self._raise_if_startup_stopped(stop_requested)
                     authentication_runtime = await self._bind_runtime(
                         Realm.PERSISTENT,
                         self._owner.main_tab,
                     )
+                    await self._raise_if_startup_stopped(stop_requested)
                     await authentication_runtime._authenticate(self._authenticator)
+                    await self._raise_if_startup_stopped(stop_requested)
 
                     runtimes: dict[Realm, RealmRuntime[TabT]] = {}
                     if Realm.PERSISTENT in self._enabled_realms:
                         runtimes[Realm.PERSISTENT] = authentication_runtime
                     if Realm.ISEKAI in self._enabled_realms:
+                        await self._raise_if_startup_stopped(stop_requested)
                         isekai_transport = await self._owner.open_tab(
                             Realm.ISEKAI.value
                         )
+                        await self._raise_if_startup_stopped(stop_requested)
                         isekai = await self._bind_runtime(
                             Realm.ISEKAI,
                             isekai_transport,
                         )
+                        await self._raise_if_startup_stopped(stop_requested)
                         await isekai._establish()
+                        await self._raise_if_startup_stopped(stop_requested)
                         runtimes[Realm.ISEKAI] = isekai
                 except BaseException as startup_error:
-                    try:
-                        await self._owner.close()
-                    except BaseException as cleanup_error:
+                    cleanup_error, delayed_cancellation = (
+                        await self._wait_for_close_task(self._ensure_close_task())
+                    )
+                    self._state = AccountContextState.CLOSED
+                    if cleanup_error is not None:
                         startup_error.add_note(
                             "account browser cleanup also failed: "
                             f"{type(cleanup_error).__name__}"
                         )
-                    self._state = AccountContextState.CLOSED
+                    if delayed_cancellation is not None:
+                        raise delayed_cancellation from None
                     raise
 
                 self._runtimes = runtimes
@@ -579,15 +641,24 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                 return self
 
     async def close(self) -> None:
-        """Close the single browser owner; bound drivers never close it."""
+        """Close the owner, postponing caller cancellation until it finishes."""
 
         async with self._lifecycle_lock:
             if self._state is AccountContextState.CLOSED:
                 return
-            try:
-                await self._owner.close()
-            finally:
-                self._state = AccountContextState.CLOSED
+            cleanup_error, delayed_cancellation = await self._wait_for_close_task(
+                self._ensure_close_task()
+            )
+            self._state = AccountContextState.CLOSED
+            if delayed_cancellation is not None:
+                if cleanup_error is not None:
+                    delayed_cancellation.add_note(
+                        "account browser cleanup also failed: "
+                        f"{type(cleanup_error).__name__}"
+                    )
+                raise delayed_cancellation from None
+            if cleanup_error is not None:
+                raise cleanup_error
 
     async def __aenter__(self) -> Self:
         return await self.start()
@@ -607,6 +678,7 @@ __all__ = [
     "AccountContextError",
     "AccountContextState",
     "AccountContextStateError",
+    "AccountContextStartupStopped",
     "BoundDriverFactory",
     "CurrentUrlReader",
     "HentaiVerseAccountContext",

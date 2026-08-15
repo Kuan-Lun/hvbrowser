@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from collections.abc import Awaitable, Callable, Collection, Iterator
 from contextlib import contextmanager
@@ -6,6 +7,7 @@ from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
 
 from hvbrowser.account_context import (
+    AccountContextStartupStopped,
     AccountContextState,
     AccountContextStateError,
     HentaiVerseAccountContext,
@@ -94,6 +96,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         authenticator: Callable[[RealmBoundHVDriver], Awaitable[None]] | None = None,
         enabled_realms: Collection[Realm] = tuple(Realm),
         account_label: str | None = None,
+        on_open_tab: Callable[[], None] | None = None,
     ) -> tuple[
         HentaiVerseAccountContext[_FakeBrowser, _FakeTab],
         _FakeBrowser,
@@ -113,6 +116,8 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
 
         async def open_tab(_: _FakeBrowser) -> _FakeTab:
             isekai_tab.opened = True
+            if on_open_tab is not None:
+                on_open_tab()
             return isekai_tab
 
         async def navigate(tab: _FakeTab, url: str) -> None:
@@ -467,6 +472,127 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         browser_closer.assert_awaited_once()
         with self.assertRaises(AccountContextStateError):
             await context.start()
+
+    async def test_preexisting_stop_never_starts_the_browser(self) -> None:
+        context, _, persistent_tab, isekai_tab, browser_closer, authentications = (
+            self._context()
+        )
+
+        with self.assertRaises(AccountContextStartupStopped):
+            await context.start(stop_requested=lambda: True)
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(authentications, [])
+        self.assertEqual(persistent_tab.navigations, [])
+        self.assertFalse(isekai_tab.opened)
+        browser_closer.assert_not_awaited()
+
+    async def test_stop_after_login_does_not_open_the_next_realm(self) -> None:
+        stop = False
+        authentications: list[str] = []
+
+        async def authenticate(driver: RealmBoundHVDriver) -> None:
+            nonlocal stop
+            authentications.append(driver.tab_handle.target_id)
+            await driver.page.get(HENTAIVERSE_ROOT_URL)
+            stop = True
+
+        context, _, persistent_tab, isekai_tab, browser_closer, _ = self._context(
+            authenticator=authenticate
+        )
+
+        with self.assertRaises(AccountContextStartupStopped):
+            await context.start(stop_requested=lambda: stop)
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(authentications, ["persistent-target"])
+        self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
+        self.assertFalse(isekai_tab.opened)
+        browser_closer.assert_awaited_once()
+
+    async def test_stop_after_tab_open_does_not_bind_or_establish_that_realm(
+        self,
+    ) -> None:
+        stop = False
+
+        def request_stop() -> None:
+            nonlocal stop
+            stop = True
+
+        context, _, _, isekai_tab, browser_closer, authentications = self._context(
+            on_open_tab=request_stop
+        )
+
+        with self.assertRaises(AccountContextStartupStopped):
+            await context.start(stop_requested=lambda: stop)
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(authentications, ["persistent-target"])
+        self.assertTrue(isekai_tab.opened)
+        self.assertEqual(isekai_tab.navigations, [])
+        browser_closer.assert_awaited_once()
+
+    async def test_startup_cleanup_survives_repeated_cancellation(self) -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        async def fail_authentication(_: RealmBoundHVDriver) -> None:
+            raise PermissionError("login failed")
+
+        async def close_browser(_: _FakeBrowser) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+        context, _, _, _, browser_closer, _ = self._context(
+            authenticator=fail_authentication
+        )
+        browser_closer.side_effect = close_browser
+
+        starting = asyncio.create_task(context.start())
+        await close_started.wait()
+        starting.cancel()
+        await asyncio.sleep(0)
+        starting.cancel()
+        await asyncio.sleep(0)
+
+        self.assertFalse(starting.done())
+        self.assertEqual(context.state, AccountContextState.NEW)
+
+        allow_close.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await starting
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        browser_closer.assert_awaited_once()
+
+    async def test_close_survives_repeated_cancellation(self) -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        async def close_browser(_: _FakeBrowser) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+        context, _, _, _, browser_closer, _ = self._context()
+        browser_closer.side_effect = close_browser
+        await context.start()
+
+        closing = asyncio.create_task(context.close())
+        await close_started.wait()
+        closing.cancel()
+        await asyncio.sleep(0)
+        closing.cancel()
+        await asyncio.sleep(0)
+
+        self.assertFalse(closing.done())
+        self.assertEqual(context.state, AccountContextState.OPEN)
+
+        allow_close.set()
+        with self.assertRaises(asyncio.CancelledError):
+            await closing
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        browser_closer.assert_awaited_once()
 
     async def test_close_is_idempotent_and_runtimes_require_open_context(self) -> None:
         context, _, _, _, browser_closer, _ = self._context()

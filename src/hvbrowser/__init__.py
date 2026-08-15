@@ -2,6 +2,7 @@
 
 from .account_context import (
     AccountContextError,
+    AccountContextStartupStopped,
     AccountContextState,
     AccountContextStateError,
     HentaiVerseAccountContext,
@@ -76,6 +77,7 @@ __all__ = [
     "AccountContextError",
     "AccountContextState",
     "AccountContextStateError",
+    "AccountContextStartupStopped",
     "EquipmentRepairClient",
     "EquipmentRepairOutcome",
     "EquipmentRepairPageError",
