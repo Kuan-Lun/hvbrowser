@@ -6,6 +6,7 @@ from hvbrowser import (
     LotteryClient,
     LotteryKind,
     LotteryPageError,
+    LotterySnapshot,
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
     MaintenanceNavigator,
@@ -36,6 +37,7 @@ def _driver(page: object) -> SimpleNamespace:
         page=page,
         get=AsyncMock(),
         gohomepage=AsyncMock(),
+        wait=AsyncMock(),
     )
 
 
@@ -231,27 +233,199 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
     async def test_lottery_opens_requested_menu_through_shared_navigation(
         self,
     ) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=la"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
         bazaar = SimpleNamespace(mouse_move=AsyncMock())
         menu_entry = SimpleNamespace(
             mouse_move=AsyncMock(),
             mouse_click=AsyncMock(),
         )
         page = SimpleNamespace(
-            evaluate=AsyncMock(return_value=_markers()),
+            evaluate=AsyncMock(side_effect=evaluate),
             select=AsyncMock(return_value=bazaar),
             xpath=AsyncMock(return_value=[menu_entry]),
-            wait=AsyncMock(),
         )
         driver = _driver(page)
 
         await LotteryClient(driver, _navigation(driver))._navigate(LotteryKind.ARMOR)
 
-        page.xpath.assert_awaited_once_with(
-            "//div[contains(text(), 'Armor Lottery')]",
-            timeout=5,
-        )
+        menu_xpath = page.xpath.await_args.args[0]
+        self.assertIn("//*[@id='child_Bazaar']", menu_xpath)
+        self.assertIn("contains(@onclick, 'ss=la')", menu_xpath)
+        self.assertIn("contains(@href, 'ss=la')", menu_xpath)
         bazaar.mouse_move.assert_awaited_once_with()
-        menu_entry.mouse_click.assert_awaited_once_with()
+        driver.wait.assert_awaited_once_with(
+            menu_entry.mouse_click,
+            ischangeurl=True,
+        )
+        driver.get.assert_not_awaited()
+
+    async def test_lottery_unchanged_menu_route_uses_direct_url_once(self) -> None:
+        urls = iter(
+            [
+                "https://hentaiverse.org/",
+                "https://hentaiverse.org/?s=Bazaar&ss=lt",
+            ]
+        )
+
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return next(urls)
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        bazaar = SimpleNamespace(mouse_move=AsyncMock())
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=bazaar),
+            xpath=AsyncMock(return_value=[menu_entry]),
+        )
+        driver = _driver(page)
+
+        with self.assertLogs("hvbrowser.lottery", level="WARNING") as captured:
+            await LotteryClient(driver, _navigation(driver))._navigate(
+                LotteryKind.WEAPON
+            )
+
+        driver.wait.assert_awaited_once_with(
+            menu_entry.mouse_click,
+            ischangeurl=True,
+        )
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=lt")
+        self.assertEqual(driver.get.await_count, 1)
+        self.assertIn("retrying once", captured.output[0])
+
+    async def test_lottery_correct_route_reloads_once_after_read_error(self) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=lt"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        bazaar = SimpleNamespace(mouse_move=AsyncMock())
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=bazaar),
+            xpath=AsyncMock(
+                side_effect=[
+                    [menu_entry],
+                    [],
+                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
+                    [SimpleNamespace(text="You hold 200 tickets")],
+                ]
+            ),
+        )
+        driver = _driver(page)
+
+        with self.assertLogs("hvbrowser.lottery", level="WARNING") as captured:
+            snapshot = await LotteryClient(driver, _navigation(driver)).inspect(
+                LotteryKind.WEAPON
+            )
+
+        self.assertEqual(
+            snapshot,
+            LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200),
+        )
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=lt")
+        self.assertEqual(driver.get.await_count, 1)
+        self.assertIn("not readable after navigation", captured.output[0])
+
+    async def test_lottery_second_read_error_is_not_retried(self) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=la"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        bazaar = SimpleNamespace(mouse_move=AsyncMock())
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=bazaar),
+            xpath=AsyncMock(side_effect=[[menu_entry], [], []]),
+        )
+        driver = _driver(page)
+
+        with self.assertRaisesRegex(LotteryPageError, "GP balance is missing"):
+            await LotteryClient(driver, _navigation(driver)).inspect(LotteryKind.ARMOR)
+
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=la")
+        self.assertEqual(driver.get.await_count, 1)
+        self.assertEqual(page.xpath.await_count, 3)
+
+    async def test_lottery_direct_fallback_rejects_wrong_realm(self) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/isekai/?s=Bazaar&ss=lt"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=object()),
+            xpath=AsyncMock(return_value=[]),
+        )
+        driver = _driver(page)
+
+        with self.assertRaisesRegex(LotteryPageError, "wrong realm"):
+            await LotteryClient(driver, _navigation(driver))._navigate(
+                LotteryKind.WEAPON
+            )
+
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=lt")
+        self.assertEqual(driver.get.await_count, 1)
+
+    async def test_lottery_battle_before_direct_fallback_stops_safely(self) -> None:
+        marker_results = iter(
+            [
+                _markers(),
+                _markers(),
+                _markers(active=True),
+            ]
+        )
+
+        async def evaluate(script: str) -> object:
+            if "nextFloor" in script and "battle_main" in script:
+                return next(marker_results)
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=object()),
+            xpath=AsyncMock(return_value=[]),
+        )
+        driver = _driver(page)
+
+        with self.assertRaises(MaintenanceNavigationBlockedError) as raised:
+            await LotteryClient(driver, _navigation(driver))._navigate(
+                LotteryKind.ARMOR
+            )
+
+        self.assertIs(
+            raised.exception.blocker,
+            MaintenanceNavigationBlocker.ACTIVE,
+        )
+        driver.get.assert_not_awaited()
 
     async def test_lottery_propagates_typed_battle_block(self) -> None:
         page = SimpleNamespace(
@@ -285,18 +459,34 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         )
         driver.gohomepage.assert_not_awaited()
 
-    async def test_lottery_wraps_non_timeout_bazaar_error(self) -> None:
+    async def test_lottery_bazaar_error_uses_direct_url(self) -> None:
         selection_error = RuntimeError("disconnected")
+
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=la"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
         page = SimpleNamespace(
-            evaluate=AsyncMock(return_value=_markers()),
+            evaluate=AsyncMock(side_effect=evaluate),
             select=AsyncMock(side_effect=selection_error),
+            xpath=AsyncMock(
+                side_effect=[
+                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
+                    [SimpleNamespace(text="You hold 100 tickets")],
+                ]
+            ),
         )
         driver = _driver(page)
 
-        with self.assertRaisesRegex(LotteryPageError, "Bazaar menu") as raised:
-            await LotteryClient(driver, _navigation(driver)).inspect(LotteryKind.ARMOR)
+        snapshot = await LotteryClient(driver, _navigation(driver)).inspect(
+            LotteryKind.ARMOR
+        )
 
-        self.assertIs(raised.exception.__cause__, selection_error)
+        self.assertEqual(snapshot.tickets, 100)
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=la")
 
 
 if __name__ == "__main__":

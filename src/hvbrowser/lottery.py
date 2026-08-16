@@ -6,13 +6,16 @@ import re
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
+from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigator,
+    classify_maintenance_navigation_blocker,
 )
-from .realm import Realm
+from .realm import Realm, realm_from_url
 from .runtime import setup_logger
+from .urls import HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
 
@@ -22,6 +25,16 @@ LOTTERY_TICKET_PRICE_GP = 1_000
 class LotteryKind(StrEnum):
     WEAPON = "Weapon Lottery"
     ARMOR = "Armor Lottery"
+
+
+_LOTTERY_ROUTES = {
+    LotteryKind.WEAPON: "lt",
+    LotteryKind.ARMOR: "la",
+}
+_LOTTERY_URLS = {
+    kind: f"{HENTAIVERSE_ROOT_URL}/?s=Bazaar&ss={route}"
+    for kind, route in _LOTTERY_ROUTES.items()
+}
 
 
 @dataclass(frozen=True, slots=True)
@@ -47,6 +60,10 @@ class LotteryPageError(RuntimeError):
     """The Lottery page did not expose the expected read-only structure."""
 
 
+class _LotteryNavigationSafetyError(LotteryPageError):
+    """The current battle state, origin, or realm could not be trusted."""
+
+
 class LotterySubmissionError(RuntimeError):
     """A ticket purchase was rejected or could not be confirmed."""
 
@@ -57,6 +74,15 @@ class LotteryStateChangedError(RuntimeError):
 
 class _LotteryDriver(Protocol):
     page: Any
+
+    async def get(self, url: str) -> None: ...
+
+    async def wait(
+        self,
+        fun: Any,
+        ischangeurl: bool,
+        sleeptime: int = 1,
+    ) -> None: ...
 
 
 def _parse_first_integer(text: str, *, field: str) -> int:
@@ -105,6 +131,18 @@ class LotteryClient:
         if not isinstance(kind, LotteryKind):
             raise TypeError("kind must be a LotteryKind")
         await self._navigate(kind)
+        try:
+            return await self._inspect_current(kind)
+        except LotteryPageError as error:
+            logger.warning(
+                "Lottery page was not readable after navigation; "
+                "reloading once through the Persistent direct URL: "
+                "kind=%s error_type=%s",
+                kind.value,
+                type(error).__name__,
+            )
+
+        await self._open_directly(kind)
         return await self._inspect_current(kind)
 
     async def purchase(
@@ -217,6 +255,25 @@ class LotteryClient:
 
     async def _navigate(self, kind: LotteryKind) -> None:
         try:
+            await self._open_from_menu(kind)
+            return
+        except MaintenanceNavigationBlockedError:
+            raise
+        except _LotteryNavigationSafetyError:
+            raise
+        except LotteryPageError as error:
+            logger.warning(
+                "Lottery menu navigation did not open the requested page; "
+                "retrying once through the Persistent direct URL: "
+                "kind=%s error_type=%s",
+                kind.value,
+                type(error).__name__,
+            )
+
+        await self._open_directly(kind)
+
+    async def _open_from_menu(self, kind: LotteryKind) -> None:
+        try:
             bazaar = await self.navigation.select_bazaar(
                 Realm.PERSISTENT,
                 navigate_first=True,
@@ -225,10 +282,17 @@ class LotteryClient:
             raise
         except Exception as error:
             raise LotteryPageError("Bazaar menu is missing") from error
+
+        route = _LOTTERY_ROUTES[kind]
+        menu_xpath = (
+            "//*[@id='child_Bazaar']"
+            f"//*[@onclick and contains(@onclick, 's=Bazaar') "
+            f"and contains(@onclick, 'ss={route}')]"
+            f" | //*[@id='child_Bazaar']//a[contains(@href, 's=Bazaar') "
+            f"and contains(@href, 'ss={route}')]"
+        )
         try:
-            elements = await self.page.xpath(
-                f"//div[contains(text(), '{kind.value}')]", timeout=5
-            )
+            elements = await self.page.xpath(menu_xpath, timeout=5)
         except Exception as error:
             raise LotteryPageError(f"Unable to find {kind.value} menu entry") from error
         if not elements:
@@ -237,10 +301,71 @@ class LotteryClient:
         try:
             await bazaar.mouse_move()
             await elements[0].mouse_move()
-            await elements[0].mouse_click()
-            await self.page.wait(1)
+            await self.driver.wait(
+                elements[0].mouse_click,
+                ischangeurl=True,
+            )
         except Exception as error:
             raise LotteryPageError(f"Unable to open {kind.value}") from error
+
+        await self._verify_destination(kind)
+
+    async def _open_directly(self, kind: LotteryKind) -> None:
+        await self._ensure_navigation_is_safe("before direct Lottery navigation")
+        try:
+            await self.driver.get(_LOTTERY_URLS[kind])
+        except Exception as error:
+            try:
+                await self._ensure_navigation_is_safe("after direct Lottery navigation")
+            except MaintenanceNavigationBlockedError as blocked:
+                raise blocked from error
+            except _LotteryNavigationSafetyError as safety_error:
+                raise safety_error from error
+            raise LotteryPageError(
+                f"Unable to open {kind.value} through its direct URL"
+            ) from error
+
+        await self._verify_destination(kind)
+
+    async def _ensure_navigation_is_safe(self, context: str) -> None:
+        try:
+            blocker = await classify_maintenance_navigation_blocker(self.page)
+        except Exception as error:
+            raise _LotteryNavigationSafetyError(
+                f"Unable to verify battle state {context}"
+            ) from error
+        if blocker is not None:
+            raise MaintenanceNavigationBlockedError(blocker)
+
+    async def _verify_destination(self, kind: LotteryKind) -> None:
+        await self._ensure_navigation_is_safe(f"after opening {kind.value}")
+        try:
+            current_url = await self.page.evaluate("window.location.href")
+            landed_realm = realm_from_url(current_url)
+        except Exception as error:
+            raise _LotteryNavigationSafetyError(
+                f"Unable to verify the {kind.value} URL"
+            ) from error
+        if landed_realm is not Realm.PERSISTENT:
+            raise _LotteryNavigationSafetyError(
+                "Lottery navigation landed in the wrong realm"
+            )
+        if not isinstance(current_url, str):
+            raise _LotteryNavigationSafetyError("Lottery URL is invalid")
+        parsed_url = urlsplit(current_url)
+        if parsed_url.path != "/":
+            raise _LotteryNavigationSafetyError(
+                "Lottery navigation landed on an unexpected path"
+            )
+        query = parse_qs(parsed_url.query, keep_blank_values=True)
+        expected_query = {
+            "s": ["Bazaar"],
+            "ss": [_LOTTERY_ROUTES[kind]],
+        }
+        if any(query.get(key) != value for key, value in expected_query.items()):
+            raise LotteryPageError(
+                f"Lottery navigation did not land on the {kind.value} route"
+            )
 
     async def _inspect_current(self, kind: LotteryKind) -> LotterySnapshot:
         try:

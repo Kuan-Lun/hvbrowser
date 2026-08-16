@@ -61,14 +61,19 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 side_effect=[
                     [SimpleNamespace(text="You currently have no GP")],
                     [SimpleNamespace(text="You hold no tickets")],
+                    [SimpleNamespace(text="You currently have no GP")],
+                    [SimpleNamespace(text="You hold no tickets")],
                 ]
             )
         )
         client = _client(SimpleNamespace(page=page))
         client._navigate = AsyncMock()  # type: ignore[method-assign]
+        client._open_directly = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(LotteryPageError, "GP balance"):
             await client.inspect(LotteryKind.ARMOR)
+
+        client._open_directly.assert_awaited_once_with(LotteryKind.ARMOR)
 
     async def test_purchase_rejects_invalid_amount_before_inspection(self) -> None:
         client = _client(SimpleNamespace(page=SimpleNamespace()))
