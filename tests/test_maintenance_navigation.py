@@ -11,6 +11,8 @@ from hvbrowser import (
     MaintenanceNavigationBlocker,
     MaintenanceNavigator,
     MonsterLabClient,
+    MonsterLabPageError,
+    MonsterLabSnapshot,
     Realm,
     RealmNavigator,
     classify_maintenance_navigation_blocker,
@@ -458,6 +460,268 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
             MaintenanceNavigationBlocker.CHALLENGE,
         )
         driver.gohomepage.assert_not_awaited()
+
+    async def test_monster_lab_opens_clickable_menu_and_verifies_route(self) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=ml"
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        bazaar = SimpleNamespace(mouse_move=AsyncMock())
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=bazaar),
+            xpath=AsyncMock(return_value=[menu_entry]),
+        )
+        driver = _driver(page)
+
+        await MonsterLabClient(driver, _navigation(driver))._navigate()
+
+        menu_xpath = page.xpath.await_args.args[0]
+        self.assertIn("//*[@id='child_Bazaar']", menu_xpath)
+        self.assertIn("contains(@onclick, 'ss=ml')", menu_xpath)
+        self.assertIn("contains(@href, 'ss=ml')", menu_xpath)
+        bazaar.mouse_move.assert_awaited_once_with()
+        driver.wait.assert_awaited_once_with(
+            menu_entry.mouse_click,
+            ischangeurl=True,
+        )
+        driver.get.assert_not_awaited()
+
+    async def test_monster_lab_unchanged_menu_route_uses_direct_url_once(self) -> None:
+        urls = iter(
+            [
+                "https://hentaiverse.org/",
+                "https://hentaiverse.org/?s=Bazaar&ss=ml",
+            ]
+        )
+
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return next(urls)
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        bazaar = SimpleNamespace(mouse_move=AsyncMock())
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=bazaar),
+            xpath=AsyncMock(return_value=[menu_entry]),
+        )
+        driver = _driver(page)
+
+        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
+            await MonsterLabClient(driver, _navigation(driver))._navigate()
+
+        driver.wait.assert_awaited_once_with(
+            menu_entry.mouse_click,
+            ischangeurl=True,
+        )
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=ml")
+        self.assertEqual(driver.get.await_count, 1)
+        self.assertIn("retrying once", captured.output[0])
+
+    async def test_monster_lab_correct_route_reloads_once_after_read_error(
+        self,
+    ) -> None:
+        api_results = iter([False, True])
+
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=ml"
+            if script == "typeof do_feed_all === 'function'":
+                return next(api_results)
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=SimpleNamespace(mouse_move=AsyncMock())),
+            xpath=AsyncMock(side_effect=[[menu_entry], [], []]),
+        )
+        driver = _driver(page)
+
+        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
+            snapshot = await MonsterLabClient(driver, _navigation(driver)).inspect()
+
+        self.assertEqual(snapshot, MonsterLabSnapshot(frozenset()))
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=ml")
+        self.assertEqual(driver.get.await_count, 1)
+        self.assertIn("not readable after navigation", captured.output[0])
+
+    async def test_monster_lab_second_read_error_is_not_retried(self) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=ml"
+            if script == "typeof do_feed_all === 'function'":
+                return False
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        menu_entry = SimpleNamespace(
+            mouse_move=AsyncMock(),
+            mouse_click=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=SimpleNamespace(mouse_move=AsyncMock())),
+            xpath=AsyncMock(return_value=[menu_entry]),
+        )
+        driver = _driver(page)
+
+        with self.assertRaisesRegex(MonsterLabPageError, "API is missing"):
+            await MonsterLabClient(driver, _navigation(driver)).inspect()
+
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=ml")
+        self.assertEqual(driver.get.await_count, 1)
+
+    async def test_monster_lab_caps_menu_fallback_and_read_retry_at_two_direct_opens(
+        self,
+    ) -> None:
+        async def evaluate(script: str) -> object:
+            if script == "window.location.href":
+                return "https://hentaiverse.org/?s=Bazaar&ss=ml"
+            if script == "typeof do_feed_all === 'function'":
+                return False
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers()
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=SimpleNamespace(mouse_move=AsyncMock())),
+            xpath=AsyncMock(return_value=[]),
+        )
+        driver = _driver(page)
+
+        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
+            with self.assertRaisesRegex(MonsterLabPageError, "API is missing"):
+                await MonsterLabClient(driver, _navigation(driver)).inspect()
+
+        expected_url = "https://hentaiverse.org/?s=Bazaar&ss=ml"
+        self.assertEqual(
+            [call.args for call in driver.get.await_args_list],
+            [(expected_url,), (expected_url,)],
+        )
+        api_checks = [
+            call
+            for call in page.evaluate.await_args_list
+            if call.args == ("typeof do_feed_all === 'function'",)
+        ]
+        self.assertEqual(len(api_checks), 2)
+        self.assertEqual(len(captured.output), 2)
+        self.assertIn("retrying once", captured.output[0])
+        self.assertIn("not readable after navigation", captured.output[1])
+
+    async def test_monster_lab_direct_fallback_rejects_untrusted_destination(
+        self,
+    ) -> None:
+        cases = (
+            (
+                "https://hentaiverse.org/isekai/?s=Bazaar&ss=ml",
+                "wrong realm",
+            ),
+            (
+                "https://example.test/?s=Bazaar&ss=ml",
+                "verify the Monster Lab URL",
+            ),
+            (
+                "https://hentaiverse.org/unexpected?s=Bazaar&ss=ml",
+                "unexpected path",
+            ),
+            (
+                "https://hentaiverse.org/?s=Bazaar&ss=la",
+                "requested route",
+            ),
+        )
+
+        for current_url, message in cases:
+            with self.subTest(current_url=current_url):
+
+                async def evaluate(script: str) -> object:
+                    if script == "window.location.href":
+                        return current_url
+                    if "nextFloor" in script and "battle_main" in script:
+                        return _markers()
+                    raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+                page = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))
+                driver = _driver(page)
+
+                with self.assertRaisesRegex(MonsterLabPageError, message):
+                    await MonsterLabClient(
+                        driver,
+                        _navigation(driver),
+                    )._open_directly()
+
+                driver.get.assert_awaited_once_with(
+                    "https://hentaiverse.org/?s=Bazaar&ss=ml"
+                )
+
+    async def test_monster_lab_battle_before_direct_fallback_stops_safely(
+        self,
+    ) -> None:
+        marker_results = iter(
+            [
+                _markers(),
+                _markers(),
+                _markers(active=True),
+            ]
+        )
+
+        async def evaluate(script: str) -> object:
+            if "nextFloor" in script and "battle_main" in script:
+                return next(marker_results)
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        page = SimpleNamespace(
+            evaluate=AsyncMock(side_effect=evaluate),
+            select=AsyncMock(return_value=object()),
+            xpath=AsyncMock(return_value=[]),
+        )
+        driver = _driver(page)
+
+        with self.assertRaises(MaintenanceNavigationBlockedError) as raised:
+            await MonsterLabClient(driver, _navigation(driver))._navigate()
+
+        self.assertIs(raised.exception.blocker, MaintenanceNavigationBlocker.ACTIVE)
+        driver.get.assert_not_awaited()
+
+    async def test_monster_lab_battle_after_direct_navigation_stops_safely(
+        self,
+    ) -> None:
+        marker_results = iter([_markers(), _markers(active=True)])
+
+        async def evaluate(script: str) -> object:
+            if "nextFloor" in script and "battle_main" in script:
+                return next(marker_results)
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
+        page = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))
+        driver = _driver(page)
+
+        with self.assertRaises(MaintenanceNavigationBlockedError) as raised:
+            await MonsterLabClient(driver, _navigation(driver))._open_directly()
+
+        self.assertIs(raised.exception.blocker, MaintenanceNavigationBlocker.ACTIVE)
+        driver.get.assert_awaited_once_with("https://hentaiverse.org/?s=Bazaar&ss=ml")
 
     async def test_lottery_bazaar_error_uses_direct_url(self) -> None:
         selection_error = RuntimeError("disconnected")

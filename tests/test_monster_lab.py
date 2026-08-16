@@ -1,4 +1,5 @@
 import unittest
+from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock
 
 from hvbrowser import (
@@ -26,15 +27,18 @@ async def _no_sleep(_seconds: float) -> None:
 
 
 class _FakeElement:
-    def __init__(self) -> None:
+    def __init__(self, *, on_click: Callable[[], None] | None = None) -> None:
         self.mouse_move_count = 0
         self.mouse_click_count = 0
+        self._on_click = on_click
 
     async def mouse_move(self) -> None:
         self.mouse_move_count += 1
 
     async def mouse_click(self) -> None:
         self.mouse_click_count += 1
+        if self._on_click is not None:
+            self._on_click()
 
 
 class _FakeMonsterLabPage:
@@ -49,8 +53,15 @@ class _FakeMonsterLabPage:
         self.preserve_after_submit = False
         self.submission_result = True
         self.submission_error: Exception | None = None
+        self.current_url = "https://hentaiverse.org/"
         self.bazaar = _FakeElement()
-        self.menu_entry = _FakeElement()
+        self.menu_entry = _FakeElement(
+            on_click=lambda: setattr(
+                self,
+                "current_url",
+                "https://hentaiverse.org/?s=Bazaar&ss=ml",
+            )
+        )
         self.evaluated: list[str] = []
         self.xpath_calls: list[tuple[str, int]] = []
         self.waited: list[int] = []
@@ -62,7 +73,12 @@ class _FakeMonsterLabPage:
 
     async def xpath(self, selector: str, timeout: int) -> list[_FakeElement]:
         self.xpath_calls.append((selector, timeout))
-        if selector == "//div[contains(text(), 'Monster Lab')]" and timeout == 5:
+        if (
+            "//*[@id='child_Bazaar']" in selector
+            and "contains(@onclick, 'ss=ml')" in selector
+            and "contains(@href, 'ss=ml')" in selector
+            and timeout == 5
+        ):
             return [self.menu_entry] if self.has_menu_entry else []
         for resource, action in (
             (MonsterLabFeed.FOOD, "feed"),
@@ -77,6 +93,8 @@ class _FakeMonsterLabPage:
         self.evaluated.append(expression)
         if "riddlesubmit" in expression and "finishbattle.png" in expression:
             return _maintenance_markers()
+        if expression == "window.location.href":
+            return self.current_url
         if expression == "typeof do_feed_all === 'function'":
             return self.has_api
         if self.submission_error is not None:
@@ -96,9 +114,25 @@ class _FakeMonsterLabDriver:
     def __init__(self, page: _FakeMonsterLabPage) -> None:
         self.page = page
         self.homepage_calls: list[bool] = []
+        self.get_calls: list[str] = []
+        self.wait_calls: list[tuple[Callable[[], Awaitable[None]], bool, int]] = []
 
     async def gohomepage(self, force: bool = False) -> None:
         self.homepage_calls.append(force)
+        self.page.current_url = "https://hentaiverse.org/"
+
+    async def get(self, url: str) -> None:
+        self.get_calls.append(url)
+        self.page.current_url = url
+
+    async def wait(
+        self,
+        fun: Callable[[], Awaitable[None]],
+        ischangeurl: bool,
+        sleeptime: int = -1,
+    ) -> None:
+        self.wait_calls.append((fun, ischangeurl, sleeptime))
+        await fun()
 
 
 def _client(
@@ -148,11 +182,17 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.bazaar.mouse_move_count, 1)
         self.assertEqual(page.menu_entry.mouse_move_count, 1)
         self.assertEqual(page.menu_entry.mouse_click_count, 1)
-        self.assertEqual(page.waited, [1])
-        self.assertEqual(len(page.evaluated), 3)
+        self.assertEqual(
+            driver.wait_calls,
+            [(page.menu_entry.mouse_click, True, -1)],
+        )
+        self.assertEqual(page.waited, [])
+        self.assertEqual(len(page.evaluated), 5)
         self.assertIn("riddlesubmit", page.evaluated[0])
         self.assertIn("riddlesubmit", page.evaluated[1])
-        self.assertEqual(page.evaluated[2], "typeof do_feed_all === 'function'")
+        self.assertIn("riddlesubmit", page.evaluated[2])
+        self.assertEqual(page.evaluated[3], "window.location.href")
+        self.assertEqual(page.evaluated[4], "typeof do_feed_all === 'function'")
 
     async def test_inspect_fails_closed_when_page_api_is_missing(self) -> None:
         page = _FakeMonsterLabPage()
@@ -161,12 +201,20 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(MonsterLabPageError, "API is missing"):
             await _client(_FakeMonsterLabDriver(page)).inspect()
 
-    async def test_inspect_fails_closed_when_menu_is_missing(self) -> None:
+    async def test_inspect_uses_direct_url_when_menu_is_missing(self) -> None:
         page = _FakeMonsterLabPage()
         page.has_menu_entry = False
+        driver = _FakeMonsterLabDriver(page)
 
-        with self.assertRaisesRegex(MonsterLabPageError, "menu entry"):
-            await _client(_FakeMonsterLabDriver(page)).inspect()
+        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
+            snapshot = await _client(driver).inspect()
+
+        self.assertEqual(snapshot, MonsterLabSnapshot(frozenset()))
+        self.assertEqual(
+            driver.get_calls,
+            ["https://hentaiverse.org/?s=Bazaar&ss=ml"],
+        )
+        self.assertIn("retrying once", captured.output[0])
 
     async def test_feed_all_returns_noop_without_submitting_when_unavailable(
         self,
@@ -231,6 +279,11 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
             ).feed_all(MonsterLabFeed.FOOD)
+
+        submission_scripts = [
+            script for script in page.evaluated if 'do_feed_all("food")' in script
+        ]
+        self.assertEqual(len(submission_scripts), 1)
 
     async def test_feed_all_rejects_unconfirmed_result(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
