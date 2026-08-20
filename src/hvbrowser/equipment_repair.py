@@ -12,10 +12,19 @@ from .maintenance_navigation import (
     classify_maintenance_navigation_blocker,
 )
 from .realm import Realm, RealmNavigator, realm_from_url
-from .runtime import setup_logger
+from .runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
+
+_READ_TIMEOUT_SECONDS = 8.0
+_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
 
 _EQUIPMENT_COUNT_XPATH = "//*[@id='equipform']//label[@id='equipcount']"
 _REPAIR_SUBMIT_XPATH = "//*[@id='equipform']//input[@id='equipsubmit']"
@@ -136,6 +145,9 @@ class _EquipmentRepairDriver(Protocol):
         fun: Any,
         ischangeurl: bool,
         sleeptime: int = 1,
+        *,
+        owner: Any,
+        operation_timeout: float,
     ) -> None: ...
 
 
@@ -226,9 +238,19 @@ class EquipmentRepairClient:
             )
 
         try:
-            await submit.mouse_click()
-            await self.page.wait(2)
+            await wait_for_zendriver(
+                submit.mouse_click(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=submit,
+            )
+            await wait_for_zendriver(
+                self.page.wait(2),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairSubmissionError(
                 "Equipment repair outcome is unknown"
             ) from error
@@ -278,8 +300,12 @@ class EquipmentRepairClient:
             await self.driver.wait(
                 repair.click,
                 ischangeurl=True,
+                owner=repair,
+                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             try:
                 await self._ensure_navigation_is_safe("after opening Repair")
             except MaintenanceNavigationBlockedError as blocked:
@@ -299,11 +325,22 @@ class EquipmentRepairClient:
         except MaintenanceNavigationBlockedError:
             raise
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError("Unable to open Bazaar") from error
 
         try:
-            armory_elements = await self.page.xpath(_ARMORY_MENU_XPATH, timeout=5)
+            armory_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _ARMORY_MENU_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to find The Armory menu entry"
             ) from error
@@ -312,24 +349,42 @@ class EquipmentRepairClient:
 
         armory = armory_elements[0]
         try:
-            await bazaar.mouse_move()
+            await wait_for_zendriver(
+                bazaar.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=bazaar,
+            )
             await self._wait_for_armory_menu(armory)
-            await armory.mouse_move()
+            await wait_for_zendriver(
+                armory.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=armory,
+            )
             await self.driver.wait(
                 armory.mouse_click,
                 ischangeurl=True,
+                owner=armory,
+                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
             )
         except EquipmentRepairPageError:
             raise
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError("Unable to open The Armory") from error
 
     async def _wait_for_armory_menu(self, armory: Any) -> None:
         last_error: Exception | None = None
         for attempt in range(_ARMORY_MENU_VISIBILITY_ATTEMPTS):
             try:
-                position = await armory.get_position()
+                position = await wait_for_zendriver(
+                    armory.get_position(),
+                    timeout=_READ_TIMEOUT_SECONDS,
+                    owner=armory,
+                )
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 last_error = error
             else:
                 if position is not None:
@@ -337,8 +392,14 @@ class EquipmentRepairClient:
 
             if attempt + 1 < _ARMORY_MENU_VISIBILITY_ATTEMPTS:
                 try:
-                    await self.page.wait(_ARMORY_MENU_VISIBILITY_INTERVAL_SECONDS)
+                    await wait_for_zendriver(
+                        self.page.wait(_ARMORY_MENU_VISIBILITY_INTERVAL_SECONDS),
+                        timeout=_READ_TIMEOUT_SECONDS,
+                        owner=self.page,
+                    )
                 except Exception as error:
+                    if is_browser_generation_error(error):
+                        raise
                     raise EquipmentRepairPageError(
                         "Unable to wait for The Armory menu entry"
                     ) from error
@@ -355,6 +416,8 @@ class EquipmentRepairClient:
         try:
             await self.driver.get(_ARMORY_URLS[realm])
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             try:
                 await self._ensure_navigation_is_safe("after direct Armory navigation")
             except MaintenanceNavigationBlockedError as blocked:
@@ -371,6 +434,8 @@ class EquipmentRepairClient:
         try:
             blocker = await classify_maintenance_navigation_blocker(self.page)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _EquipmentRepairNavigationSafetyError(
                 f"Unable to verify battle state {context}"
             ) from error
@@ -380,9 +445,15 @@ class EquipmentRepairClient:
     async def _verify_repair_destination(self, realm: Realm) -> None:
         await self._ensure_navigation_is_safe("after opening Repair")
         try:
-            current_url = await self.page.evaluate("window.location.href")
+            current_url = await wait_for_zendriver(
+                self.page.evaluate("window.location.href"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
             landed_realm = realm_from_url(current_url)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _EquipmentRepairNavigationSafetyError(
                 "Unable to verify the Repair URL"
             ) from error
@@ -417,11 +488,17 @@ class EquipmentRepairClient:
 
     async def _find_repair_tab(self) -> Any:
         try:
-            repair_elements = await self.page.xpath(
-                _REPAIR_TAB_XPATH,
-                timeout=5,
+            repair_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _REPAIR_TAB_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError("Unable to find Repair tab") from error
         if not repair_elements:
             raise EquipmentRepairPageError("Unable to find Repair tab")
@@ -429,11 +506,17 @@ class EquipmentRepairClient:
 
     async def _verify_repair_selected(self) -> None:
         try:
-            selected_tabs = await self.page.xpath(
-                _REPAIR_SELECTED_PAGE_XPATH,
-                timeout=5,
+            selected_tabs = await wait_for_zendriver(
+                self.page.xpath(
+                    _REPAIR_SELECTED_PAGE_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to verify the Armory Repair page"
             ) from error
@@ -449,18 +532,30 @@ class EquipmentRepairClient:
         await self._verify_repair_destination(realm)
 
         try:
-            equipcount_elements = await self.page.xpath(
-                _EQUIPMENT_COUNT_XPATH,
-                timeout=5,
+            equipcount_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _EQUIPMENT_COUNT_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to inspect equipment repair count"
             ) from error
 
         try:
-            raw_state = await self.page.evaluate(_EQUIPMENT_STATE_SCRIPT)
+            raw_state = await wait_for_zendriver(
+                self.page.evaluate(_EQUIPMENT_STATE_SCRIPT),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to inspect equipment repair count"
             ) from error
@@ -494,18 +589,31 @@ class EquipmentRepairClient:
     async def _select_all_and_inspect_submit(self, equipcount: Any) -> tuple[bool, Any]:
         logger.debug("Before select-all click: %r", getattr(equipcount, "text", None))
         try:
-            await self.driver.wait(equipcount.mouse_click, ischangeurl=False)
+            await self.driver.wait(
+                equipcount.mouse_click,
+                ischangeurl=False,
+                owner=equipcount,
+                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to select equipment for repair"
             ) from error
 
         try:
-            submit_elements = await self.page.xpath(
-                _REPAIR_SUBMIT_XPATH,
-                timeout=5,
+            submit_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _REPAIR_SUBMIT_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to inspect equipment repair submission"
             ) from error
@@ -513,10 +621,14 @@ class EquipmentRepairClient:
             raise EquipmentRepairPageError("Equipment repair submit button is missing")
 
         try:
-            is_disabled = await self.page.evaluate(
-                "document.getElementById('equipsubmit').disabled"
+            is_disabled = await wait_for_zendriver(
+                self.page.evaluate("document.getElementById('equipsubmit').disabled"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise EquipmentRepairPageError(
                 "Unable to inspect equipment repair submit state"
             ) from error
@@ -525,30 +637,36 @@ class EquipmentRepairClient:
 
         if is_disabled and logger.isEnabledFor(logging.DEBUG):
             try:
-                debug_state = await self.page.evaluate("""
-                    JSON.stringify({
-                        selected_count: selected_count,
-                        selectable_count: selectable_count,
-                        block_submit: block_submit,
-                        materials: (() => {
-                            const totals = {};
-                            for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
-                                if (el.checked && eqitems[el.value]) {
-                                    for (const m in eqitems[el.value].m) {
-                                        totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
+                debug_state = await wait_for_zendriver(
+                    self.page.evaluate("""
+                        JSON.stringify({
+                            selected_count: selected_count,
+                            selectable_count: selectable_count,
+                            block_submit: block_submit,
+                            materials: (() => {
+                                const totals = {};
+                                for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
+                                    if (el.checked && eqitems[el.value]) {
+                                        for (const m in eqitems[el.value].m) {
+                                            totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
+                                        }
                                     }
                                 }
-                            }
-                            return Object.entries(totals).map(([id, need]) => ({
-                                id,
-                                name: itemdata[id] ? itemdata[id].n : undefined,
-                                need,
-                                have: itemdata[id] ? itemdata[id].c : undefined,
-                            }));
-                        })(),
-                    })
-                    """)
+                                return Object.entries(totals).map(([id, need]) => ({
+                                    id,
+                                    name: itemdata[id] ? itemdata[id].n : undefined,
+                                    need,
+                                    have: itemdata[id] ? itemdata[id].c : undefined,
+                                }));
+                            })(),
+                        })
+                        """),
+                    timeout=_READ_TIMEOUT_SECONDS,
+                    owner=self.page,
+                )
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 logger.debug(
                     "Repair submit diagnostic probe failed: error_type=%s",
                     type(error).__name__,

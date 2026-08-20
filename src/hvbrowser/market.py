@@ -4,10 +4,18 @@ from enum import StrEnum
 from typing import Any, Protocol
 
 from .realm import Realm, RealmNavigator
+from .runtime import ZendriverOperationTimeout, wait_for_zendriver
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 MARKET_ROOT_URL = f"{HENTAIVERSE_ROOT_URL}/"
 ISEKAI_MARKET_ROOT_URL = HENTAIVERSE_ISEKAI_ROOT_URL
+
+_READ_TIMEOUT_SECONDS = 8.0
+_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
+_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS = 1.0
+_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS = 3.0
 
 
 class MarketCategory(StrEnum):
@@ -272,12 +280,28 @@ class MarketClient:
                     f"Market sale plan is stale for {item.name!r}: "
                     f"planned={item.stock}, current={sale_form.current_stock}"
                 )
-            await self._driver.page.evaluate(
-                f"autofill_from_sell_order({sale_form.sell_order_id},0,0);"
+            await wait_for_zendriver(
+                self._driver.page.evaluate(
+                    f"autofill_from_sell_order({sale_form.sell_order_id},0,0);"
+                ),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
-            await sale_form.stock_control.click()
-            await sale_form.update_button.click()
-            await self._driver.page.wait(1)
+            await wait_for_zendriver(
+                sale_form.stock_control.click(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=sale_form.stock_control,
+            )
+            await wait_for_zendriver(
+                sale_form.update_button.click(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=sale_form.update_button,
+            )
+            await wait_for_zendriver(
+                self._driver.page.wait(1),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self._driver.page,
+            )
             await self._raise_for_submission_error(item)
 
             remaining_stock = await self._read_item_stock(item, realm=plan.realm)
@@ -294,17 +318,33 @@ class MarketClient:
             market_item_url(item.category, item.item_id, realm=realm)
         )
         try:
-            sell_order_cells = await self._driver.page.xpath(
-                "//*[@id='market_itemsell']"
-                "//td[contains(@onclick, 'autofill_from_sell_order')]",
-                timeout=5,
+            sell_order_cells = await wait_for_zendriver(
+                self._driver.page.xpath(
+                    "//*[@id='market_itemsell']"
+                    "//td[contains(@onclick, 'autofill_from_sell_order')]",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
-            stock_control = await self._driver.page.select(
-                "#sell_order_stock_field > span", timeout=5
+            stock_control = await wait_for_zendriver(
+                self._driver.page.select(
+                    "#sell_order_stock_field > span",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
-            update_button = await self._driver.page.select(
-                "#sellorder_update", timeout=5
+            update_button = await wait_for_zendriver(
+                self._driver.page.select(
+                    "#sellorder_update",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError as error:
             raise MarketPageError(
                 f"Market sale form is missing for {item.name!r}"
@@ -327,9 +367,16 @@ class MarketClient:
             market_item_url(item.category, item.item_id, realm=realm)
         )
         try:
-            stock_control = await self._driver.page.select(
-                "#sell_order_stock_field > span", timeout=5
+            stock_control = await wait_for_zendriver(
+                self._driver.page.select(
+                    "#sell_order_stock_field > span",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError as error:
             raise MarketSubmissionError(
                 f"Market stock confirmation is missing for {item.name!r}"
@@ -348,9 +395,16 @@ class MarketClient:
 
     async def _raise_for_submission_error(self, item: MarketItem) -> None:
         try:
-            error_message = await self._driver.page.select(
-                "#messagebox_inner p.messagebox_error", timeout=1
+            error_message = await wait_for_zendriver(
+                self._driver.page.select(
+                    "#messagebox_inner p.messagebox_error",
+                    timeout=_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
             )
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError:
             return
         message = error_message.text.strip() or "unknown Market error"
@@ -361,16 +415,33 @@ class MarketClient:
     ) -> list[MarketItem]:
         await self._driver.get(market_browse_url(category, realm=realm))
         try:
-            item_list = await self._driver.page.select("#market_itemlist", timeout=5)
+            item_list = await wait_for_zendriver(
+                self._driver.page.select(
+                    "#market_itemlist",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self._driver.page,
+            )
+        except ZendriverOperationTimeout:
+            raise
         except TimeoutError as error:
             raise MarketPageError(
                 f"Market item list is missing for {market_category_label(category)}"
             ) from error
 
-        rows = await item_list.query_selector_all("table > tbody > tr[onclick]")
+        rows = await wait_for_zendriver(
+            item_list.query_selector_all("table > tbody > tr[onclick]"),
+            timeout=_READ_TIMEOUT_SECONDS,
+            owner=item_list,
+        )
         items: list[MarketItem] = []
         for row in rows:
-            cells = await row.query_selector_all("td")
+            cells = await wait_for_zendriver(
+                row.query_selector_all("td"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=row,
+            )
             if len(cells) < 2:
                 raise MarketPageError(
                     f"Market row has fewer than two cells in "

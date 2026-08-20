@@ -29,7 +29,11 @@ from hbrowser.gallery.browser import (
 
 from .hv import HVDriver
 from .realm import Realm, RealmDetectionError, realm_from_url
-from .runtime import log_context
+from .runtime import (
+    is_browser_generation_error,
+    log_context,
+    wait_for_zendriver,
+)
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 type AccountAuthenticator = Callable[[RealmBoundHVDriver], Awaitable[None]]
@@ -37,6 +41,8 @@ type BoundDriverFactory[TabT] = Callable[
     [Realm, TabTransport[TabT]], RealmBoundHVDriver
 ]
 type CurrentUrlReader[TabT] = Callable[[TabT], Awaitable[object]]
+
+_CURRENT_URL_TIMEOUT_SECONDS = 8.0
 
 
 def _never_stop() -> bool:
@@ -72,6 +78,7 @@ class AccountContextState(StrEnum):
 
     NEW = "new"
     OPEN = "open"
+    CLOSING = "closing"
     CLOSED = "closed"
 
 
@@ -94,10 +101,6 @@ def realm_root_url(realm: Realm) -> str:
     if realm is Realm.ISEKAI:
         return HENTAIVERSE_ISEKAI_ROOT_URL
     return HENTAIVERSE_ROOT_URL
-
-
-async def _read_zendriver_url(tab: Any) -> object:
-    return await tab.evaluate("window.location.href")
 
 
 async def _default_authenticator(driver: RealmBoundHVDriver) -> None:
@@ -200,7 +203,7 @@ class RealmRuntime[TabT]:
         realm: Realm,
         transport: TabTransport[TabT],
         driver: RealmBoundHVDriver,
-        current_url_reader: CurrentUrlReader[TabT],
+        current_url_reader: CurrentUrlReader[TabT] | None,
         account_label: str | None = None,
     ) -> None:
         if transport.role != realm.value:
@@ -251,7 +254,23 @@ class RealmRuntime[TabT]:
             realm=self._realm.value,
             tab_role=self.tab_handle.role,
         ):
-            return await self._transport.execute(self._current_url_reader)
+
+            async def read(tab: TabT) -> object:
+                reader = self._current_url_reader
+                if reader is None:
+                    page = cast(Any, tab)
+                    return await wait_for_zendriver(
+                        page.evaluate("window.location.href"),
+                        timeout=_CURRENT_URL_TIMEOUT_SECONDS,
+                        owner=page,
+                    )
+                return await wait_for_zendriver(
+                    reader(tab),
+                    timeout=_CURRENT_URL_TIMEOUT_SECONDS,
+                    owner=tab,
+                )
+
+            return await self._transport.execute(read)
 
     async def current_realm(self) -> Realm:
         """Inspect the realm currently displayed by the fixed tab."""
@@ -296,6 +315,13 @@ class RealmRuntime[TabT]:
             try:
                 await self._navigate_home()
             except BaseException as restore_error:
+                if not isinstance(
+                    restore_error, Exception
+                ) or is_browser_generation_error(restore_error):
+                    restore_error.add_note(
+                        "browser generation failed while restoring the bound realm"
+                    )
+                    raise
                 drift_error.add_note(
                     "restoring the bound realm also failed: "
                     f"{type(restore_error).__name__}"
@@ -325,6 +351,10 @@ class RealmRuntime[TabT]:
                 try:
                     result = await self._transport.execute(run)
                 except BaseException as operation_error:
+                    if not isinstance(
+                        operation_error, Exception
+                    ) or is_browser_generation_error(operation_error):
+                        raise
                     try:
                         await self._restore_after_operation()
                     except RealmBindingViolationError as binding_error:
@@ -454,10 +484,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
             target_id_getter=target_id_getter,
         )
         self._authenticator = authenticator or _default_authenticator
-        self._current_url_reader = current_url_reader or cast(
-            CurrentUrlReader[TabT],
-            _read_zendriver_url,
-        )
+        self._current_url_reader = current_url_reader
         self._driver_factory = driver_factory or cast(
             BoundDriverFactory[TabT],
             lambda realm, transport: RealmBoundHVDriver(
@@ -548,10 +575,25 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
 
     def _ensure_close_task(self) -> asyncio.Task[None]:
         task = self._close_task
+        if task is not None and task.done():
+            if not task.cancelled():
+                task.exception()
+            self._close_task = None
+            task = None
         if task is None:
             task = asyncio.create_task(self._owner.close())
             self._close_task = task
         return task
+
+    def _record_close_attempt(self, cleanup_error: BaseException | None) -> None:
+        """Expose failed owner cleanup as retriable instead of terminal."""
+
+        self._close_task = None
+        self._state = (
+            AccountContextState.CLOSED
+            if cleanup_error is None
+            else AccountContextState.CLOSING
+        )
 
     @staticmethod
     async def _wait_for_close_task(
@@ -566,6 +608,10 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
             except asyncio.CancelledError as error:
                 if delayed_cancellation is None:
                     delayed_cancellation = error
+            except BaseException:
+                # The completed task is inspected exactly once below so cleanup
+                # failures can update the retriable lifecycle state first.
+                pass
 
         try:
             task.result()
@@ -623,10 +669,11 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                         await self._raise_if_startup_stopped(stop_requested)
                         runtimes[Realm.ISEKAI] = isekai
                 except BaseException as startup_error:
+                    self._state = AccountContextState.CLOSING
                     cleanup_error, delayed_cancellation = (
                         await self._wait_for_close_task(self._ensure_close_task())
                     )
-                    self._state = AccountContextState.CLOSED
+                    self._record_close_attempt(cleanup_error)
                     if cleanup_error is not None:
                         startup_error.add_note(
                             "account browser cleanup also failed: "
@@ -646,10 +693,11 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         async with self._lifecycle_lock:
             if self._state is AccountContextState.CLOSED:
                 return
+            self._state = AccountContextState.CLOSING
             cleanup_error, delayed_cancellation = await self._wait_for_close_task(
                 self._ensure_close_task()
             )
-            self._state = AccountContextState.CLOSED
+            self._record_close_attempt(cleanup_error)
             if delayed_cancellation is not None:
                 if cleanup_error is not None:
                     delayed_cancellation.add_note(

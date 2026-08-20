@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser.player import (
     PlayerClient,
@@ -10,6 +11,7 @@ from hvbrowser.player import (
     StaminaRecoveryError,
     StaminaRecoveryOutcome,
 )
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 def _element(text: str = "") -> SimpleNamespace:
@@ -132,6 +134,34 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(StaminaRecoveryError, "did not increase"):
             await PlayerClient(driver).recover_stamina()
+
+    async def test_recovery_click_hang_is_terminal_without_followup_probe(self) -> None:
+        release = asyncio.Event()
+
+        async def hang() -> None:
+            await release.wait()
+
+        restorative = _element()
+        restorative.mouse_click.side_effect = hang
+        driver = _driver(
+            xpath_results=[
+                [_element("Stamina: 80")],
+                [restorative],
+            ],
+            selected=_element("Stamina: 80"),
+        )
+
+        with (
+            patch("hvbrowser.player._MUTATION_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await PlayerClient(driver).recover_stamina()
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        self.assertEqual(driver.page.xpath.await_count, 2)
+        driver.page.wait.assert_not_awaited()
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_expected_stamina_prevents_a_stale_recovery(self) -> None:
         driver = _driver(xpath_results=[[_element("Stamina: 79")]])

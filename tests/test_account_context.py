@@ -18,11 +18,11 @@ from hvbrowser.account_context import (
     RealmTabBindingError,
 )
 from hvbrowser.realm import Realm
-from hvbrowser.runtime import log_context
+from hvbrowser.runtime import ZendriverOperationTimeout, log_context
 from hvbrowser.urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 
-@dataclass(slots=True)
+@dataclass
 class _FakeTab:
     target_id: str
     url: str = "about:blank"
@@ -39,7 +39,7 @@ class _FakeTab:
         self.navigations.append(url)
 
 
-@dataclass(slots=True)
+@dataclass
 class _FakeBrowser:
     current_tab: _FakeTab
 
@@ -97,6 +97,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         enabled_realms: Collection[Realm] = tuple(Realm),
         account_label: str | None = None,
         on_open_tab: Callable[[], None] | None = None,
+        current_url_reader: Callable[[_FakeTab], Awaitable[object]] | None = None,
     ) -> tuple[
         HentaiVerseAccountContext[_FakeBrowser, _FakeTab],
         _FakeBrowser,
@@ -135,6 +136,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             tab_factory=open_tab,
             tab_navigator=navigate,
             target_id_getter=lambda tab: tab.target_id,
+            current_url_reader=current_url_reader,
             enabled_realms=enabled_realms,
             account_label=account_label,
         )
@@ -411,6 +413,56 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
         self.assertEqual(persistent_tab.navigations[-1], HENTAIVERSE_ROOT_URL)
 
+    async def test_injected_current_url_reader_hang_is_bounded_inside_transport(
+        self,
+    ) -> None:
+        should_hang = False
+        reader_started = asyncio.Event()
+        release_reader = asyncio.Event()
+
+        async def read_url(tab: _FakeTab) -> object:
+            if not should_hang:
+                return tab.url
+            reader_started.set()
+            await release_reader.wait()
+            return tab.url
+
+        context, *_ = self._context(
+            enabled_realms=(Realm.PERSISTENT,),
+            current_url_reader=read_url,
+        )
+        await context.start()
+        should_hang = True
+
+        with patch(
+            "hvbrowser.account_context._CURRENT_URL_TIMEOUT_SECONDS",
+            0.01,
+        ):
+            reading = asyncio.create_task(context.persistent.current_realm())
+            await reader_started.wait()
+
+            contender_entered = asyncio.Event()
+
+            async def contender(_: _FakeTab) -> None:
+                contender_entered.set()
+
+            contender_task = asyncio.create_task(
+                context.persistent.transport.execute(contender)
+            )
+            await asyncio.sleep(0)
+            self.assertFalse(contender_entered.is_set())
+            contender_task.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await contender_task
+
+            with self.assertRaises(ZendriverOperationTimeout) as raised:
+                await reading
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        release_reader.set()
+        await asyncio.sleep(0)
+        await context.close()
+
     async def test_runtime_restores_and_reports_post_operation_drift(self) -> None:
         context, _, persistent_tab, _, _, _ = self._context()
         await context.start()
@@ -423,6 +475,27 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             await context.persistent.execute(cross_realm)
 
         self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
+
+    async def test_realm_restore_timeout_remains_a_generation_error(self) -> None:
+        context, *_ = self._context(enabled_realms=(Realm.PERSISTENT,))
+        await context.start()
+        self.addAsyncCleanup(context.close)
+        runtime = context.persistent
+        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
+        runtime._assert_current_realm = AsyncMock(  # type: ignore[method-assign]
+            side_effect=RealmTabBindingError("drifted")
+        )
+        runtime._navigate_home = AsyncMock(  # type: ignore[method-assign]
+            side_effect=timeout
+        )
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await runtime._restore_after_operation()
+
+        self.assertIs(raised.exception, timeout)
+        self.assertTrue(
+            any("restoring the bound realm" in note for note in timeout.__notes__)
+        )
 
     async def test_failed_operation_still_restores_bound_realm(self) -> None:
         context, _, _, isekai_tab, _, _ = self._context()
@@ -556,7 +629,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertFalse(starting.done())
-        self.assertEqual(context.state, AccountContextState.NEW)
+        self.assertEqual(context.state, AccountContextState.CLOSING)
 
         allow_close.set()
         with self.assertRaises(asyncio.CancelledError):
@@ -585,7 +658,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         await asyncio.sleep(0)
 
         self.assertFalse(closing.done())
-        self.assertEqual(context.state, AccountContextState.OPEN)
+        self.assertEqual(context.state, AccountContextState.CLOSING)
 
         allow_close.set()
         with self.assertRaises(asyncio.CancelledError):
@@ -607,6 +680,45 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         browser_closer.assert_awaited_once()
         with self.assertRaises(AccountContextStateError):
             _ = context.isekai
+
+    async def test_close_can_retry_after_transient_owner_cleanup_failure(self) -> None:
+        context, _, _, _, browser_closer, _ = self._context()
+        browser_closer.side_effect = [ConnectionError("transient close failure"), None]
+        await context.start()
+
+        with self.assertRaisesRegex(ConnectionError, "transient close failure"):
+            await context.close()
+
+        self.assertEqual(context.state, AccountContextState.CLOSING)
+        with self.assertRaises(AccountContextStateError):
+            _ = context.persistent
+
+        await context.close()
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(browser_closer.await_count, 2)
+
+    async def test_startup_cleanup_can_retry_after_transient_failure(self) -> None:
+        async def fail_authentication(_: RealmBoundHVDriver) -> None:
+            raise PermissionError("login failed")
+
+        context, _, _, _, browser_closer, _ = self._context(
+            authenticator=fail_authentication
+        )
+        browser_closer.side_effect = [ConnectionError("transient close failure"), None]
+
+        with self.assertRaisesRegex(PermissionError, "login failed") as raised:
+            await context.start()
+
+        self.assertEqual(context.state, AccountContextState.CLOSING)
+        self.assertTrue(
+            any("cleanup also failed" in note for note in raised.exception.__notes__)
+        )
+
+        await context.close()
+
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(browser_closer.await_count, 2)
 
 
 async def _return[ResultT](value: ResultT) -> ResultT:

@@ -16,6 +16,7 @@ from hvbrowser.maintenance_navigation import (
     MaintenanceNavigationBlocker,
 )
 from hvbrowser.realm import Realm
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 _PERSISTENT_REPAIR_URL = (
     "https://hentaiverse.org/" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
@@ -205,6 +206,8 @@ class EquipmentRepairClientTests(unittest.IsolatedAsyncioTestCase):
                 driver.wait.assert_any_await(
                     armory.mouse_click,
                     ischangeurl=True,
+                    owner=armory,
+                    operation_timeout=15.0,
                 )
 
     async def test_unchanged_repair_route_uses_direct_fallback(self) -> None:
@@ -222,7 +225,12 @@ class EquipmentRepairClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
         driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.wait.assert_any_await(repair.click, ischangeurl=True)
+        driver.wait.assert_any_await(
+            repair.click,
+            ischangeurl=True,
+            owner=repair,
+            operation_timeout=15.0,
+        )
 
     async def test_missing_selected_marker_after_click_uses_fallback(self) -> None:
         armory, repair = _navigation_elements()
@@ -349,6 +357,36 @@ class EquipmentRepairClientTests(unittest.IsolatedAsyncioTestCase):
             await client.repair_all()
 
         driver.get.assert_not_awaited()
+
+    async def test_menu_click_timeout_is_terminal_without_safety_probe(self) -> None:
+        armory = _element("The Armory")
+        client, driver, _realm, _maintenance = _client([[armory]])
+        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
+        driver.wait.side_effect = timeout
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await client.repair_all()
+
+        self.assertIs(raised.exception, timeout)
+        driver.wait.assert_awaited_once_with(
+            armory.mouse_click,
+            ischangeurl=True,
+            owner=armory,
+            operation_timeout=15.0,
+        )
+        driver.get.assert_not_awaited()
+        driver.page.evaluate.assert_not_awaited()
+
+    async def test_direct_navigation_timeout_has_no_post_failure_probe(self) -> None:
+        client, driver, _realm, _maintenance = _client([])
+        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
+        driver.get.side_effect = timeout
+
+        with self.assertRaises(ZendriverOperationTimeout) as raised:
+            await client._open_repair_directly(Realm.PERSISTENT)
+
+        self.assertIs(raised.exception, timeout)
+        driver.page.evaluate.assert_awaited_once()
 
     async def test_direct_get_error_prefers_detected_battle_block(self) -> None:
         armory = _element("The Armory")

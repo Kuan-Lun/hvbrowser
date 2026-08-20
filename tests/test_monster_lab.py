@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from collections.abc import Awaitable, Callable
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser import (
     MaintenanceNavigator,
@@ -11,6 +12,7 @@ from hvbrowser import (
     MonsterLabSubmissionError,
     RealmNavigator,
 )
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 def _maintenance_markers() -> dict[str, bool]:
@@ -66,9 +68,16 @@ class _FakeMonsterLabPage:
         self.xpath_calls: list[tuple[str, int]] = []
         self.waited: list[int] = []
 
-    async def select(self, selector: str) -> _FakeElement | None:
+    async def select(
+        self,
+        selector: str,
+        *,
+        timeout: float,
+    ) -> _FakeElement | None:
         if selector != "#parent_Bazaar":
             raise AssertionError(f"Unexpected selector: {selector}")
+        if timeout != 5:
+            raise AssertionError(f"Unexpected selector timeout: {timeout}")
         return self.bazaar if self.has_bazaar else None
 
     async def xpath(self, selector: str, timeout: int) -> list[_FakeElement]:
@@ -115,7 +124,9 @@ class _FakeMonsterLabDriver:
         self.page = page
         self.homepage_calls: list[bool] = []
         self.get_calls: list[str] = []
-        self.wait_calls: list[tuple[Callable[[], Awaitable[None]], bool, int]] = []
+        self.wait_calls: list[
+            tuple[Callable[[], Awaitable[None]], bool, int, object, float]
+        ] = []
 
     async def gohomepage(self, force: bool = False) -> None:
         self.homepage_calls.append(force)
@@ -130,8 +141,11 @@ class _FakeMonsterLabDriver:
         fun: Callable[[], Awaitable[None]],
         ischangeurl: bool,
         sleeptime: int = -1,
+        *,
+        owner: object,
+        operation_timeout: float,
     ) -> None:
-        self.wait_calls.append((fun, ischangeurl, sleeptime))
+        self.wait_calls.append((fun, ischangeurl, sleeptime, owner, operation_timeout))
         await fun()
 
 
@@ -184,7 +198,7 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.menu_entry.mouse_click_count, 1)
         self.assertEqual(
             driver.wait_calls,
-            [(page.menu_entry.mouse_click, True, -1)],
+            [(page.menu_entry.mouse_click, True, -1, page.menu_entry, 15.0)],
         )
         self.assertEqual(page.waited, [])
         self.assertEqual(len(page.evaluated), 5)
@@ -284,6 +298,37 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
             script for script in page.evaluated if 'do_feed_all("food")' in script
         ]
         self.assertEqual(len(submission_scripts), 1)
+
+    async def test_feed_all_submit_hang_is_terminal_without_confirmation(self) -> None:
+        release = asyncio.Event()
+
+        async def hang(_: str) -> object:
+            await release.wait()
+            return True
+
+        page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
+        page.evaluate = AsyncMock(side_effect=hang)  # type: ignore[method-assign]
+        client = _client(
+            _FakeMonsterLabDriver(page),
+            confirmation_checks=2,
+            confirmation_interval=0.01,
+            sleep=_no_sleep,
+        )
+        before = MonsterLabSnapshot(frozenset({MonsterLabFeed.FOOD}))
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
+        client._inspect_current = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch("hvbrowser.monster_lab._MUTATION_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await client.feed_all(MonsterLabFeed.FOOD)
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        client._inspect_current.assert_not_awaited()
+        page.evaluate.assert_awaited_once()
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_feed_all_rejects_unconfirmed_result(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})

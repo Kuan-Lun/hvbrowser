@@ -1,6 +1,7 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser import (
     HENTAIVERSE_ISEKAI_ROOT_URL,
@@ -12,6 +13,7 @@ from hvbrowser import (
     RealmNavigator,
     realm_from_url,
 )
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 class RealmParsingTests(unittest.TestCase):
@@ -60,6 +62,29 @@ class RealmNavigatorTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(await navigator.current(), Realm.ISEKAI)
         page.evaluate.assert_awaited_once_with("window.location.href")
+
+    async def test_current_location_hang_raises_typed_watchdog_timeout(self) -> None:
+        release = asyncio.Event()
+
+        async def hang(_: str) -> str:
+            await release.wait()
+            return HENTAIVERSE_ROOT_URL
+
+        page = SimpleNamespace(evaluate=AsyncMock(side_effect=hang))
+        navigator = RealmNavigator(
+            SimpleNamespace(page=page, get=AsyncMock(), gohomepage=AsyncMock())
+        )
+
+        with (
+            patch("hvbrowser.realm._CURRENT_URL_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await navigator.current()
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        page.evaluate.assert_awaited_once_with("window.location.href")
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_go_home_routes_each_realm_through_the_browser(self) -> None:
         browser = SimpleNamespace(

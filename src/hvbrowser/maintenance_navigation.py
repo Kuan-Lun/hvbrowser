@@ -4,9 +4,17 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from .realm import Realm, RealmNavigator
-from .runtime import setup_logger
+from .runtime import (
+    ZendriverOperationTimeout,
+    setup_logger,
+    wait_for_zendriver,
+)
 
 logger = setup_logger(__name__)
+
+_MARKER_READ_TIMEOUT_SECONDS = 8.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
 
 _MAINTENANCE_MARKERS_SCRIPT = r"""
 (() => {
@@ -51,7 +59,11 @@ async def classify_maintenance_navigation_blocker(
     page: Any,
 ) -> MaintenanceNavigationBlocker | None:
     """Read all battle markers atomically and return the highest-risk state."""
-    raw: object = await page.evaluate(_MAINTENANCE_MARKERS_SCRIPT)
+    raw: object = await wait_for_zendriver(
+        page.evaluate(_MAINTENANCE_MARKERS_SCRIPT),
+        timeout=_MARKER_READ_TIMEOUT_SECONDS,
+        owner=page,
+    )
     if not isinstance(raw, dict):
         raise RuntimeError("Invalid maintenance navigation marker payload")
     payload = cast(dict[object, object], raw)
@@ -118,7 +130,16 @@ class MaintenanceNavigator:
                     raise blocker_error
 
             try:
-                bazaar = await self._driver.page.select("#parent_Bazaar")
+                bazaar = await wait_for_zendriver(
+                    self._driver.page.select(
+                        "#parent_Bazaar",
+                        timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                    ),
+                    timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                    owner=self._driver.page,
+                )
+            except ZendriverOperationTimeout:
+                raise
             except TimeoutError as error:
                 blocker_error = _blocked_error(
                     await classify_maintenance_navigation_blocker(self._driver.page)

@@ -5,9 +5,20 @@ from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol
 
-from .runtime import setup_logger
+from .runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 
 logger = setup_logger(__name__)
+
+_READ_TIMEOUT_SECONDS = 8.0
+_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
+_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS = 2.0
+_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS = 4.0
 
 _LEVEL_PATTERN = re.compile(r"(?:^|\s)Lv\.\s*([0-9]+)\s*$")
 _STAMINA_PATTERN = re.compile(r"Stamina:\s*([0-9]+)")
@@ -76,8 +87,17 @@ class PlayerClient:
     async def read_level(self) -> int:
         """Return the level displayed by the current HentaiVerse page."""
         try:
-            level_readout = await self.page.select("#level_readout", timeout=5)
+            level_readout = await wait_for_zendriver(
+                self.page.select(
+                    "#level_readout",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise PlayerPageError("Unable to find level readout") from error
         if level_readout is None:
             raise PlayerPageError("Unable to find level readout")
@@ -93,10 +113,17 @@ class PlayerClient:
     async def read_stamina(self) -> int:
         """Return the stamina displayed by the current HentaiVerse page."""
         try:
-            stamina_elements = await self.page.xpath(
-                "//div[contains(text(), 'Stamina:')]", timeout=5
+            stamina_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    "//div[contains(text(), 'Stamina:')]",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise PlayerPageError("Unable to find stamina readout") from error
         if not stamina_elements:
             raise PlayerPageError("Unable to find stamina readout")
@@ -136,19 +163,38 @@ class PlayerClient:
 
         logger.debug("Checking USR RESTORATIVE availability for stamina recovery")
         try:
-            stamina_readout = await self.page.select("#stamina_readout", timeout=5)
+            stamina_readout = await wait_for_zendriver(
+                self.page.select(
+                    "#stamina_readout",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise PlayerPageError("Unable to find stamina recovery controls") from error
         if stamina_readout is None:
             raise PlayerPageError("Unable to find stamina recovery controls")
 
         try:
-            await stamina_readout.mouse_move()
-            restorative_elements = await self.page.xpath(
-                _RESTORATIVE_XPATH,
-                timeout=5,
+            await wait_for_zendriver(
+                stamina_readout.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=stamina_readout,
+            )
+            restorative_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _RESTORATIVE_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise PlayerPageError(
                 "Unable to inspect stamina restorative availability"
             ) from error
@@ -161,18 +207,38 @@ class PlayerClient:
 
         restorative = restorative_elements[0]
         try:
-            await restorative.mouse_move()
-            await restorative.mouse_click()
-            await self.page.wait(1)
+            await wait_for_zendriver(
+                restorative.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=restorative,
+            )
+            await wait_for_zendriver(
+                restorative.mouse_click(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=restorative,
+            )
+            await wait_for_zendriver(
+                self.page.wait(1),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise StaminaRecoveryError("Stamina recovery outcome is unknown") from error
 
         try:
-            error_elements = await self.page.xpath(
-                _RECOVERY_ERROR_XPATH,
-                timeout=2,
+            error_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _RECOVERY_ERROR_XPATH,
+                    timeout=_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise StaminaRecoveryError(
                 "Unable to determine whether stamina recovery was rejected"
             ) from error
@@ -185,8 +251,14 @@ class PlayerClient:
                 server_message,
             )
             try:
-                await error_elements[0].click()
+                await wait_for_zendriver(
+                    error_elements[0].click(),
+                    timeout=_MUTATION_TIMEOUT_SECONDS,
+                    owner=error_elements[0],
+                )
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 logger.debug(
                     "Unable to dismiss stamina recovery rejection: error_type=%s",
                     type(error).__name__,

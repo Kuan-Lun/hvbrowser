@@ -1,3 +1,4 @@
+import asyncio
 import unittest
 from collections.abc import Callable
 from unittest.mock import patch
@@ -21,6 +22,7 @@ from hvbrowser.market import (
     parse_market_stock,
 )
 from hvbrowser.realm import Realm
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 class _FakeElement:
@@ -349,6 +351,35 @@ class MarketClientTests(unittest.IsolatedAsyncioTestCase):
                 _client(driver),
                 MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
             )
+
+    async def test_submit_click_hang_is_terminal_without_stock_probe(self) -> None:
+        release = asyncio.Event()
+
+        async def hang() -> None:
+            await release.wait()
+
+        driver = _FakeDriver({})
+        driver.page.update_button.click = hang  # type: ignore[method-assign]
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
+
+        with (
+            patch("hvbrowser.market._MUTATION_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await self._submit_with_verified_live_semantics(
+                _client(driver),
+                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
+            )
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        self.assertEqual(
+            driver.visited,
+            [market_item_url(item.category, item.item_id, realm=Realm.PERSISTENT)],
+        )
+        self.assertEqual(driver.page.waited, [])
+        self.assertFalse(driver.page.submitted)
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_submit_rejects_unchanged_stock(self) -> None:
         driver = _FakeDriver({})

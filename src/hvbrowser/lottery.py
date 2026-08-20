@@ -14,10 +14,19 @@ from .maintenance_navigation import (
     classify_maintenance_navigation_blocker,
 )
 from .realm import Realm, realm_from_url
-from .runtime import setup_logger
+from .runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 from .urls import HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
+
+_READ_TIMEOUT_SECONDS = 8.0
+_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
 
 LOTTERY_TICKET_PRICE_GP = 1_000
 
@@ -82,6 +91,9 @@ class _LotteryDriver(Protocol):
         fun: Any,
         ischangeurl: bool,
         sleeptime: int = 1,
+        *,
+        owner: Any,
+        operation_timeout: float,
     ) -> None: ...
 
 
@@ -175,28 +187,59 @@ class LotteryClient:
             )
 
         try:
-            ticket_input = await self.page.select("#ticket_temp")
+            ticket_input = await wait_for_zendriver(
+                self.page.select(
+                    "#ticket_temp",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Lottery ticket input is missing") from error
         if ticket_input is None:
             raise LotteryPageError("Lottery ticket input is missing")
 
         try:
-            can_submit = await self.page.evaluate("typeof submit_buy === 'function'")
+            can_submit = await wait_for_zendriver(
+                self.page.evaluate("typeof submit_buy === 'function'"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Unable to inspect Lottery purchase API") from error
         if can_submit is not True:
             raise LotteryPageError("Lottery purchase API is missing")
 
         try:
-            await ticket_input.clear_input()
-            await ticket_input.send_keys(str(amount))
+            await wait_for_zendriver(
+                ticket_input.clear_input(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=ticket_input,
+            )
+            await wait_for_zendriver(
+                ticket_input.send_keys(str(amount)),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=ticket_input,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Unable to prepare Lottery purchase") from error
 
         try:
-            await self.page.evaluate("submit_buy()")
+            await wait_for_zendriver(
+                self.page.evaluate("submit_buy()"),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotterySubmissionError(
                 f"{kind.value} purchase outcome is unknown"
             ) from error
@@ -213,6 +256,8 @@ class LotteryClient:
             try:
                 last_snapshot = await self._inspect_current(kind)
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 last_error = error
                 confirmation_error_count += 1
                 last_confirmation_error_type = type(error).__name__
@@ -281,6 +326,8 @@ class LotteryClient:
         except MaintenanceNavigationBlockedError:
             raise
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Bazaar menu is missing") from error
 
         route = _LOTTERY_ROUTES[kind]
@@ -292,20 +339,41 @@ class LotteryClient:
             f"and contains(@href, 'ss={route}')]"
         )
         try:
-            elements = await self.page.xpath(menu_xpath, timeout=5)
+            elements = await wait_for_zendriver(
+                self.page.xpath(
+                    menu_xpath,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError(f"Unable to find {kind.value} menu entry") from error
         if not elements:
             raise LotteryPageError(f"Unable to find {kind.value} menu entry")
 
         try:
-            await bazaar.mouse_move()
-            await elements[0].mouse_move()
+            await wait_for_zendriver(
+                bazaar.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=bazaar,
+            )
+            await wait_for_zendriver(
+                elements[0].mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=elements[0],
+            )
             await self.driver.wait(
                 elements[0].mouse_click,
                 ischangeurl=True,
+                owner=elements[0],
+                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError(f"Unable to open {kind.value}") from error
 
         await self._verify_destination(kind)
@@ -315,6 +383,8 @@ class LotteryClient:
         try:
             await self.driver.get(_LOTTERY_URLS[kind])
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             try:
                 await self._ensure_navigation_is_safe("after direct Lottery navigation")
             except MaintenanceNavigationBlockedError as blocked:
@@ -331,6 +401,8 @@ class LotteryClient:
         try:
             blocker = await classify_maintenance_navigation_blocker(self.page)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _LotteryNavigationSafetyError(
                 f"Unable to verify battle state {context}"
             ) from error
@@ -340,9 +412,15 @@ class LotteryClient:
     async def _verify_destination(self, kind: LotteryKind) -> None:
         await self._ensure_navigation_is_safe(f"after opening {kind.value}")
         try:
-            current_url = await self.page.evaluate("window.location.href")
+            current_url = await wait_for_zendriver(
+                self.page.evaluate("window.location.href"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
             landed_realm = realm_from_url(current_url)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _LotteryNavigationSafetyError(
                 f"Unable to verify the {kind.value} URL"
             ) from error
@@ -369,18 +447,32 @@ class LotteryClient:
 
     async def _inspect_current(self, kind: LotteryKind) -> LotterySnapshot:
         try:
-            balance_elements = await self.page.xpath(
-                "//*[contains(text(), 'You currently have')]", timeout=5
+            balance_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    "//*[contains(text(), 'You currently have')]",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Lottery GP balance is missing") from error
         if not balance_elements:
             raise LotteryPageError("Lottery GP balance is missing")
         try:
-            ticket_elements = await self.page.xpath(
-                "//*[contains(text(), 'You hold')]", timeout=5
+            ticket_elements = await wait_for_zendriver(
+                self.page.xpath(
+                    "//*[contains(text(), 'You hold')]",
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise LotteryPageError("Lottery ticket count is missing") from error
         if not ticket_elements:
             raise LotteryPageError("Lottery ticket count is missing")

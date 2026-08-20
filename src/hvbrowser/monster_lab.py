@@ -15,10 +15,21 @@ from .maintenance_navigation import (
     classify_maintenance_navigation_blocker,
 )
 from .realm import Realm, realm_from_url
-from .runtime import setup_logger
+from .runtime import (
+    is_browser_generation_error,
+    setup_logger,
+    wait_for_zendriver,
+)
 from .urls import HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
+
+_READ_TIMEOUT_SECONDS = 8.0
+_MUTATION_TIMEOUT_SECONDS = 15.0
+_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
+_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
+_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS = 2.0
+_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS = 4.0
 
 
 class MonsterLabFeed(StrEnum):
@@ -76,6 +87,9 @@ class _MonsterLabDriver(Protocol):
         fun: Any,
         ischangeurl: bool,
         sleeptime: int = -1,
+        *,
+        owner: Any,
+        operation_timeout: float,
     ) -> None: ...
 
 
@@ -138,14 +152,20 @@ class MonsterLabClient:
 
         resource_js = json.dumps(resource.value)
         try:
-            submitted = await self.page.evaluate(f"""
-                (() => {{
-                    if (typeof do_feed_all !== 'function') return false;
-                    do_feed_all({resource_js});
-                    return true;
-                }})()
-                """)
+            submitted = await wait_for_zendriver(
+                self.page.evaluate(f"""
+                    (() => {{
+                        if (typeof do_feed_all !== 'function') return false;
+                        do_feed_all({resource_js});
+                        return true;
+                    }})()
+                    """),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MonsterLabSubmissionError(
                 f"Monster Lab {resource.value} feed-all outcome is unknown"
             ) from error
@@ -163,12 +183,16 @@ class MonsterLabClient:
             try:
                 await self._sleep(self.confirmation_interval)
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 raise MonsterLabSubmissionError(
                     f"Unable to confirm Monster Lab {resource.value} feed-all"
                 ) from error
             try:
                 last_snapshot = await self._inspect_current()
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 last_error = error
                 consecutive_absences = 0
                 confirmation_error_count += 1
@@ -224,10 +248,21 @@ class MonsterLabClient:
         except MaintenanceNavigationBlockedError:
             raise
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MonsterLabPageError("Bazaar menu is missing") from error
         try:
-            elements = await self.page.xpath(_MONSTER_LAB_MENU_XPATH, timeout=5)
+            elements = await wait_for_zendriver(
+                self.page.xpath(
+                    _MONSTER_LAB_MENU_XPATH,
+                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
+                ),
+                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MonsterLabPageError(
                 "Unable to find Monster Lab menu entry"
             ) from error
@@ -235,13 +270,25 @@ class MonsterLabClient:
             raise MonsterLabPageError("Unable to find Monster Lab menu entry")
 
         try:
-            await bazaar.mouse_move()
-            await elements[0].mouse_move()
+            await wait_for_zendriver(
+                bazaar.mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=bazaar,
+            )
+            await wait_for_zendriver(
+                elements[0].mouse_move(),
+                timeout=_MUTATION_TIMEOUT_SECONDS,
+                owner=elements[0],
+            )
             await self.driver.wait(
                 elements[0].mouse_click,
                 ischangeurl=True,
+                owner=elements[0],
+                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MonsterLabPageError("Unable to open Monster Lab") from error
 
         await self._verify_destination()
@@ -251,6 +298,8 @@ class MonsterLabClient:
         try:
             await self.driver.get(_MONSTER_LAB_URL)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             try:
                 await self._ensure_navigation_is_safe(
                     "after direct Monster Lab navigation"
@@ -269,6 +318,8 @@ class MonsterLabClient:
         try:
             blocker = await classify_maintenance_navigation_blocker(self.page)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _MonsterLabNavigationSafetyError(
                 f"Unable to verify battle state {context}"
             ) from error
@@ -278,9 +329,15 @@ class MonsterLabClient:
     async def _verify_destination(self) -> None:
         await self._ensure_navigation_is_safe("after opening Monster Lab")
         try:
-            current_url = await self.page.evaluate("window.location.href")
+            current_url = await wait_for_zendriver(
+                self.page.evaluate("window.location.href"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
+            )
             landed_realm = realm_from_url(current_url)
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise _MonsterLabNavigationSafetyError(
                 "Unable to verify the Monster Lab URL"
             ) from error
@@ -307,10 +364,14 @@ class MonsterLabClient:
 
     async def _inspect_current(self) -> MonsterLabSnapshot:
         try:
-            is_monster_lab = await self.page.evaluate(
-                "typeof do_feed_all === 'function'"
+            is_monster_lab = await wait_for_zendriver(
+                self.page.evaluate("typeof do_feed_all === 'function'"),
+                timeout=_READ_TIMEOUT_SECONDS,
+                owner=self.page,
             )
         except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MonsterLabPageError(
                 "Unable to inspect Monster Lab feed-all API"
             ) from error
@@ -320,10 +381,17 @@ class MonsterLabClient:
         available: set[MonsterLabFeed] = set()
         for resource, action in _FEED_ACTION_NAMES.items():
             try:
-                elements = await self.page.xpath(
-                    f'//img[@src="/y/monster/{action}allmonsters.png"]', timeout=2
+                elements = await wait_for_zendriver(
+                    self.page.xpath(
+                        f'//img[@src="/y/monster/{action}allmonsters.png"]',
+                        timeout=_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS,
+                    ),
+                    timeout=_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS,
+                    owner=self.page,
                 )
             except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
                 raise MonsterLabPageError(
                     f"Unable to inspect Monster Lab {resource.value} action"
                 ) from error

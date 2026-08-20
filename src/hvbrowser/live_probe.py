@@ -9,6 +9,7 @@ from .lottery import LotteryKind
 from .market import MarketCategory, MarketPageError
 from .monster_lab import MonsterLabFeed
 from .realm import Realm
+from .runtime import wait_for_zendriver
 from .session import HentaiVerseSession
 
 
@@ -17,6 +18,8 @@ class LiveProbeRefused(RuntimeError):
 
 
 _ACTIVE_BATTLE_XPATH = "//*[@id='battle_main' or @id='riddlesubmit' or @id='btcp']"
+_BATTLE_MARKER_INNER_TIMEOUT_SECONDS = 2.0
+_BATTLE_MARKER_OUTER_TIMEOUT_SECONDS = 4.0
 
 
 @dataclass(frozen=True)
@@ -87,9 +90,13 @@ async def run_live_probe(
     create_session = session_factory or (lambda: HentaiVerseSession(headless=True))
 
     async with create_session() as session:
-        battle_markers = await session.browser.page.xpath(
-            _ACTIVE_BATTLE_XPATH,
-            timeout=2,
+        battle_markers = await wait_for_zendriver(
+            session.browser.page.xpath(
+                _ACTIVE_BATTLE_XPATH,
+                timeout=_BATTLE_MARKER_INNER_TIMEOUT_SECONDS,
+            ),
+            timeout=_BATTLE_MARKER_OUTER_TIMEOUT_SECONDS,
+            owner=session.browser.page,
         )
         if battle_markers:
             raise LiveProbeRefused(

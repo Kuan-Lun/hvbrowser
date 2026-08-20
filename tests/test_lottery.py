@@ -1,7 +1,8 @@
+import asyncio
 import unittest
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, patch
 
 from hvbrowser import (
     LotteryClient,
@@ -11,6 +12,7 @@ from hvbrowser import (
     LotteryStateChangedError,
     LotterySubmissionError,
 )
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 def _client(driver: object, **kwargs: Any) -> LotteryClient:
@@ -190,6 +192,43 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
         with self.assertRaisesRegex(LotterySubmissionError, "outcome is unknown"):
             await client.purchase(LotteryKind.WEAPON, 1)
+
+    async def test_purchase_submit_hang_is_terminal_without_confirmation(self) -> None:
+        release = asyncio.Event()
+
+        async def evaluate(script: str) -> object:
+            if script == "typeof submit_buy === 'function'":
+                return True
+            if script == "submit_buy()":
+                await release.wait()
+                return None
+            raise AssertionError(f"Unexpected script: {script}")
+
+        ticket_input = SimpleNamespace(
+            clear_input=AsyncMock(),
+            send_keys=AsyncMock(),
+        )
+        page = SimpleNamespace(
+            select=AsyncMock(return_value=ticket_input),
+            evaluate=AsyncMock(side_effect=evaluate),
+        )
+        client = _client(SimpleNamespace(page=page))
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
+        client._inspect_current = AsyncMock()  # type: ignore[method-assign]
+
+        with (
+            patch("hvbrowser.lottery._MUTATION_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await client.purchase(LotteryKind.WEAPON, 1)
+
+        self.assertEqual(raised.exception.timeout_seconds, 0.01)
+        client._inspect_current.assert_not_awaited()
+        self.assertEqual(page.evaluate.await_count, 2)
+        release.set()
+        await asyncio.sleep(0)
 
     async def test_purchase_requires_exact_post_submit_confirmation(self) -> None:
         ticket_input = SimpleNamespace(
