@@ -168,6 +168,9 @@ realms.
 
 ## Development
 
+HVBrowser 0.7 requires `hbrowser>=0.40.0,<0.41`; the 0.6 compatibility line is
+not supported.
+
 Build a clean environment backed by the PyPI release of `hbrowser`:
 
 ```bash
