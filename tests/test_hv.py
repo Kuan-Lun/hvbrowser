@@ -1,7 +1,10 @@
 import asyncio
+import inspect
 import unittest
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
+
+from hbrowser import LogPersistenceError
 
 from hvbrowser import (
     HENTAIVERSE_ISEKAI_ROOT_URL,
@@ -13,6 +16,7 @@ from hvbrowser import (
     RealmNavigator,
     realm_from_url,
 )
+from hvbrowser.runtime import LogPersistenceError as RuntimeLogPersistenceError
 from hvbrowser.runtime import ZendriverOperationTimeout
 
 
@@ -176,6 +180,12 @@ class HentaiVerseSessionTests(unittest.IsolatedAsyncioTestCase):
 
 
 class RawDriverBoundaryTests(unittest.TestCase):
+    def test_runtime_reexports_log_persistence_boundary(self) -> None:
+        self.assertIs(RuntimeLogPersistenceError, LogPersistenceError)
+
+    def test_driver_inherits_public_page_diagnostic_capture(self) -> None:
+        self.assertTrue(inspect.iscoroutinefunction(HVDriver.save_page_diagnostic))
+
     def test_driver_only_installs_hentaiverse_transport_urls(self) -> None:
         driver = HVDriver(headless=True)
 

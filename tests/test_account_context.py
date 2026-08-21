@@ -280,7 +280,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
                 account_label=object(),  # type: ignore[arg-type]
             )
 
-    async def test_startup_sets_browser_login_and_establishment_contexts(
+    async def test_startup_sets_account_login_and_realm_establishment_contexts(
         self,
     ) -> None:
         context, *_ = self._context(account_label="main")
@@ -299,11 +299,17 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn(
             {
                 "account": "main",
-                "realm": "persistent",
                 "tab_role": "persistent",
                 "activity": "Login",
+                "scope": "Account · Login",
             },
             recorder.entered,
+        )
+        self.assertFalse(
+            any(
+                context.get("activity") == "Login" and "realm" in context
+                for context in recorder.entered
+            )
         )
         self.assertIn(
             {

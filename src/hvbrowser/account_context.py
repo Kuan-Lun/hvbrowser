@@ -43,6 +43,7 @@ type BoundDriverFactory[TabT] = Callable[
 type CurrentUrlReader[TabT] = Callable[[TabT], Awaitable[object]]
 
 _CURRENT_URL_TIMEOUT_SECONDS = 8.0
+_ACCOUNT_LOGIN_LOG_SCOPE = "Account · Login"
 
 
 def _never_stop() -> bool:
@@ -401,21 +402,27 @@ class RealmRuntime[TabT]:
         self,
         authenticator: AccountAuthenticator,
     ) -> None:
-        """Run the one account login before normal realm checks are enabled."""
+        """Authenticate the account through this runtime's bootstrap tab.
 
-        with log_context(
-            account=self._account_label,
-            realm=Realm.PERSISTENT.value,
-            tab_role=self.tab_handle.role,
-            activity="Login",
-        ):
-            async with self._operation_lock:
+        Authentication applies to the shared browser account, not to the
+        Persistent realm that happens to host the bootstrap tab.  Keep the tab
+        role as diagnostic metadata while giving user-facing records an
+        explicit account-level label and no realm identity.
+        """
+
+        async with self._operation_lock:
+            with log_context(
+                account=self._account_label,
+                tab_role=self.tab_handle.role,
+                activity="Login",
+                scope=_ACCOUNT_LOGIN_LOG_SCOPE,
+            ):
 
                 async def authenticate(_: TabT) -> None:
                     await authenticator(self._driver)
 
                 await self._transport.execute(authenticate)
-                await self._assert_current_realm()
+            await self._assert_current_realm()
 
     async def _establish(self) -> None:
         with log_context(

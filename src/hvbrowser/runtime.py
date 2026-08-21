@@ -7,6 +7,7 @@ requiring those packages to depend on ``hbrowser`` directly.
 
 from hbrowser.gallery.element_action import ElementAction
 from hbrowser.gallery.utils import (
+    LogPersistenceError,
     ZendriverOperationTimeout,
     is_browser_generation_error,
     log_context,
@@ -17,6 +18,7 @@ from hbrowser.notify import notify
 
 __all__ = [
     "ElementAction",
+    "LogPersistenceError",
     "ZendriverOperationTimeout",
     "is_browser_generation_error",
     "log_context",
