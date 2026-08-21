@@ -20,6 +20,7 @@ class RealmParsingTests(unittest.TestCase):
     def test_trusted_hentaiverse_urls_map_to_typed_realms(self) -> None:
         cases = (
             ("https://hentaiverse.org/", Realm.PERSISTENT),
+            ("https://hentaiverse.org:443/", Realm.PERSISTENT),
             ("https://hentaiverse.org/?s=Battle&ss=ba", Realm.PERSISTENT),
             ("https://hentaiverse.org/isekai", Realm.ISEKAI),
             ("https://hentaiverse.org/isekai/?s=Battle&ss=ba", Realm.ISEKAI),
@@ -42,6 +43,7 @@ class RealmParsingTests(unittest.TestCase):
     def test_untrusted_or_unreadable_locations_fail_closed(self) -> None:
         for url in (
             "http://hentaiverse.org/isekai/",
+            "https://hentaiverse.org:0/",
             "https://hentaiverse.org:444/isekai/",
             "https://example.test/isekai/",
             None,
@@ -132,8 +134,7 @@ class HentaiVerseSessionTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(session.browser, browser)
         self.assertIs(session.realm._driver, browser)
-        self.assertIs(session.maintenance_navigation._driver, browser)
-        self.assertIs(session.maintenance_navigation._realm, session.realm)
+        self.assertFalse(hasattr(session, "maintenance_navigation"))
         self.assertIs(session.player.driver, browser)
         self.assertIs(session.equipment.driver, browser)
         self.assertIs(session.market._driver, browser)

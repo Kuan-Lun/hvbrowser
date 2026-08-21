@@ -11,10 +11,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
-    MaintenanceNavigator,
-    classify_maintenance_navigation_blocker,
+    MaintenanceNavigationBlocker,
+    MaintenanceNavigationContext,
+    MaintenanceNavigationObservation,
+    observe_maintenance_navigation,
 )
-from .realm import Realm, realm_from_url
+from .realm import Realm
 from .runtime import (
     is_browser_generation_error,
     setup_logger,
@@ -43,13 +45,6 @@ _FEED_ACTION_NAMES: dict[MonsterLabFeed, str] = {
 }
 _MONSTER_LAB_ROUTE = "ml"
 _MONSTER_LAB_URL = f"{HENTAIVERSE_ROOT_URL}/?s=Bazaar&ss={_MONSTER_LAB_ROUTE}"
-_MONSTER_LAB_MENU_XPATH = (
-    "//*[@id='child_Bazaar']"
-    "//*[@onclick and contains(@onclick, 's=Bazaar') "
-    f"and contains(@onclick, 'ss={_MONSTER_LAB_ROUTE}')]"
-    " | //*[@id='child_Bazaar']//a[contains(@href, 's=Bazaar') "
-    f"and contains(@href, 'ss={_MONSTER_LAB_ROUTE}')]"
-)
 
 
 @dataclass(frozen=True, slots=True)
@@ -82,16 +77,6 @@ class _MonsterLabDriver(Protocol):
 
     async def get(self, url: str) -> None: ...
 
-    async def wait(
-        self,
-        fun: Any,
-        ischangeurl: bool,
-        sleeptime: int = -1,
-        *,
-        owner: Any,
-        operation_timeout: float,
-    ) -> None: ...
-
 
 class MonsterLabClient:
     """Inspect Monster Lab and invoke one explicit feed-all resource."""
@@ -99,7 +84,6 @@ class MonsterLabClient:
     def __init__(
         self,
         driver: _MonsterLabDriver,
-        navigation: MaintenanceNavigator,
         *,
         confirmation_checks: int = 5,
         confirmation_interval: float = 1,
@@ -118,7 +102,6 @@ class MonsterLabClient:
         ):
             raise ValueError("confirmation_interval must be a finite positive number")
         self.driver = driver
-        self.navigation = navigation
         self.confirmation_checks = confirmation_checks
         self.confirmation_interval = confirmation_interval
         self._sleep = sleep
@@ -127,9 +110,15 @@ class MonsterLabClient:
     def page(self) -> Any:
         return self.driver.page
 
-    async def inspect(self) -> MonsterLabSnapshot:
+    async def inspect(
+        self,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> MonsterLabSnapshot:
         """Navigate to and inspect Monster Lab without feeding monsters."""
-        await self._navigate()
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
+        await self._navigate(context=context)
         try:
             return await self._inspect_current()
         except MonsterLabPageError as error:
@@ -139,14 +128,21 @@ class MonsterLabClient:
                 type(error).__name__,
             )
 
-        await self._open_directly()
+        await self._open_directly(context=MaintenanceNavigationContext.ORDINARY)
         return await self._inspect_current()
 
-    async def feed_all(self, resource: MonsterLabFeed) -> MonsterLabFeedReport:
+    async def feed_all(
+        self,
+        resource: MonsterLabFeed,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> MonsterLabFeedReport:
         """Invoke one available feed-all operation and verify it is consumed."""
         if not isinstance(resource, MonsterLabFeed):
             raise TypeError("resource must be a MonsterLabFeed")
-        before = await self.inspect()
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
+        before = await self.inspect(context=context)
         if resource not in before.available_feed_all:
             return MonsterLabFeedReport(resource, False, before, before)
 
@@ -222,79 +218,23 @@ class MonsterLabClient:
             f"Unable to confirm Monster Lab {resource.value} feed-all"
         ) from last_error
 
-    async def _navigate(self) -> None:
-        try:
-            await self._open_from_menu()
-            return
-        except MaintenanceNavigationBlockedError:
-            raise
-        except _MonsterLabNavigationSafetyError:
-            raise
-        except MonsterLabPageError as error:
-            logger.warning(
-                "Monster Lab menu navigation did not open the requested page; "
-                "retrying once through the Persistent direct URL: error_type=%s",
-                type(error).__name__,
-            )
+    async def _navigate(
+        self,
+        *,
+        context: MaintenanceNavigationContext = MaintenanceNavigationContext.ORDINARY,
+    ) -> None:
+        await self._open_directly(context=context)
 
-        await self._open_directly()
-
-    async def _open_from_menu(self) -> None:
-        try:
-            bazaar = await self.navigation.select_bazaar(
-                Realm.PERSISTENT,
-                navigate_first=True,
-            )
-        except MaintenanceNavigationBlockedError:
-            raise
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise MonsterLabPageError("Bazaar menu is missing") from error
-        try:
-            elements = await wait_for_zendriver(
-                self.page.xpath(
-                    _MONSTER_LAB_MENU_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise MonsterLabPageError(
-                "Unable to find Monster Lab menu entry"
-            ) from error
-        if not elements:
-            raise MonsterLabPageError("Unable to find Monster Lab menu entry")
-
-        try:
-            await wait_for_zendriver(
-                bazaar.mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=bazaar,
-            )
-            await wait_for_zendriver(
-                elements[0].mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=elements[0],
-            )
-            await self.driver.wait(
-                elements[0].mouse_click,
-                ischangeurl=True,
-                owner=elements[0],
-                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise MonsterLabPageError("Unable to open Monster Lab") from error
-
-        await self._verify_destination()
-
-    async def _open_directly(self) -> None:
-        await self._ensure_navigation_is_safe("before direct Monster Lab navigation")
+    async def _open_directly(
+        self,
+        *,
+        context: MaintenanceNavigationContext = MaintenanceNavigationContext.ORDINARY,
+    ) -> None:
+        await self._ensure_navigation_is_safe(
+            Realm.PERSISTENT,
+            "before direct Monster Lab navigation",
+            context=context,
+        )
         try:
             await self.driver.get(_MONSTER_LAB_URL)
         except Exception as error:
@@ -302,7 +242,9 @@ class MonsterLabClient:
                 raise
             try:
                 await self._ensure_navigation_is_safe(
-                    "after direct Monster Lab navigation"
+                    Realm.PERSISTENT,
+                    "after direct Monster Lab navigation",
+                    context=MaintenanceNavigationContext.ORDINARY,
                 )
             except MaintenanceNavigationBlockedError as blocked:
                 raise blocked from error
@@ -314,44 +256,48 @@ class MonsterLabClient:
 
         await self._verify_destination()
 
-    async def _ensure_navigation_is_safe(self, context: str) -> None:
+    async def _ensure_navigation_is_safe(
+        self,
+        expected_realm: Realm,
+        phase: str,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> MaintenanceNavigationObservation:
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
         try:
-            blocker = await classify_maintenance_navigation_blocker(self.page)
+            observation = await observe_maintenance_navigation(self.page)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
             raise _MonsterLabNavigationSafetyError(
-                f"Unable to verify battle state {context}"
+                f"Unable to verify battle state {phase}"
             ) from error
-        if blocker is not None:
-            raise MaintenanceNavigationBlockedError(blocker)
+        if observation.realm is not expected_realm:
+            raise _MonsterLabNavigationSafetyError(
+                f"Monster Lab navigation is on an untrusted or wrong realm {phase}"
+            )
+        expected_path = "/isekai/" if expected_realm is Realm.ISEKAI else "/"
+        if urlsplit(observation.url).path != expected_path:
+            raise _MonsterLabNavigationSafetyError(
+                f"Monster Lab navigation is on an unexpected path {phase}"
+            )
+        may_leave_completion = (
+            context is MaintenanceNavigationContext.POST_BATTLE
+            and expected_realm is Realm.PERSISTENT
+            and observation.blocker is MaintenanceNavigationBlocker.COMPLETION
+        )
+        if observation.blocker is not None and not may_leave_completion:
+            raise MaintenanceNavigationBlockedError(observation.blocker)
+        return observation
 
     async def _verify_destination(self) -> None:
-        await self._ensure_navigation_is_safe("after opening Monster Lab")
-        try:
-            current_url = await wait_for_zendriver(
-                self.page.evaluate("window.location.href"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-            landed_realm = realm_from_url(current_url)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _MonsterLabNavigationSafetyError(
-                "Unable to verify the Monster Lab URL"
-            ) from error
-        if landed_realm is not Realm.PERSISTENT:
-            raise _MonsterLabNavigationSafetyError(
-                "Monster Lab navigation landed in the wrong realm"
-            )
-        if not isinstance(current_url, str):
-            raise _MonsterLabNavigationSafetyError("Monster Lab URL is invalid")
-        parsed_url = urlsplit(current_url)
-        if parsed_url.path != "/":
-            raise _MonsterLabNavigationSafetyError(
-                "Monster Lab navigation landed on an unexpected path"
-            )
+        observation = await self._ensure_navigation_is_safe(
+            Realm.PERSISTENT,
+            "after opening Monster Lab",
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
+        parsed_url = urlsplit(observation.url)
         query = parse_qs(parsed_url.query, keep_blank_values=True)
         expected_query = {
             "s": ["Bazaar"],

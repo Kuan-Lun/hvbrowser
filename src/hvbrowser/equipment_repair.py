@@ -8,10 +8,10 @@ from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
-    MaintenanceNavigator,
-    classify_maintenance_navigation_blocker,
+    MaintenanceNavigationObservation,
+    observe_maintenance_navigation,
 )
-from .realm import Realm, RealmNavigator, realm_from_url
+from .realm import Realm, RealmNavigator
 from .runtime import (
     is_browser_generation_error,
     setup_logger,
@@ -28,18 +28,6 @@ _SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
 
 _EQUIPMENT_COUNT_XPATH = "//*[@id='equipform']//label[@id='equipcount']"
 _REPAIR_SUBMIT_XPATH = "//*[@id='equipform']//input[@id='equipsubmit']"
-_ARMORY_MENU_XPATH = (
-    "//*[@id='child_Bazaar']"
-    "//*[@onclick and contains(@onclick, 's=Bazaar') "
-    "and contains(@onclick, 'ss=am')]"
-    " | //*[@id='child_Bazaar']//a[contains(@href, 's=Bazaar') "
-    "and contains(@href, 'ss=am')]"
-)
-_REPAIR_TAB_XPATH = (
-    "//*[@id='armory_left']/a[contains(@href, 'screen=repair') "
-    "and ./*[contains(concat(' ', normalize-space(@class), ' '), "
-    "' armory_tab ')]]"
-)
 _REPAIR_SELECTED_PAGE_XPATH = (
     "//*[@id='armory_outer']["
     ".//*[@id='armory_left']/a[contains(@href, 'screen=repair')]"
@@ -75,8 +63,6 @@ _EQUIPMENT_STATE_SCRIPT = """
     };
 })()
 """
-_ARMORY_MENU_VISIBILITY_ATTEMPTS = 20
-_ARMORY_MENU_VISIBILITY_INTERVAL_SECONDS = 0.1
 _ARMORY_URLS = {
     Realm.PERSISTENT: (
         f"{HENTAIVERSE_ROOT_URL}/" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
@@ -158,11 +144,9 @@ class EquipmentRepairClient:
         self,
         driver: _EquipmentRepairDriver,
         realm: RealmNavigator,
-        maintenance: MaintenanceNavigator,
     ) -> None:
         self.driver = driver
         self.realm = realm
-        self.maintenance = maintenance
 
     @property
     def page(self) -> Any:
@@ -275,151 +259,23 @@ class EquipmentRepairClient:
         )
 
     async def _navigate(self, realm: Realm) -> None:
-        try:
-            await self._open_repair_from_menu(realm)
-            return
-        except MaintenanceNavigationBlockedError:
-            raise
-        except _EquipmentRepairNavigationSafetyError:
-            raise
-        except EquipmentRepairPageError as error:
-            logger.warning(
-                "Armory menu navigation did not open Repair; retrying through "
-                "the realm-scoped direct URL: realm=%s error_type=%s",
-                realm.value,
-                type(error).__name__,
-            )
-
         await self._open_repair_directly(realm)
 
-    async def _open_repair_from_menu(self, realm: Realm) -> None:
-        await self._open_armory_from_menu(realm)
-        repair = await self._find_repair_tab()
-
-        try:
-            await self.driver.wait(
-                repair.click,
-                ischangeurl=True,
-                owner=repair,
-                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            try:
-                await self._ensure_navigation_is_safe("after opening Repair")
-            except MaintenanceNavigationBlockedError as blocked:
-                raise blocked from error
-            except _EquipmentRepairNavigationSafetyError as safety_error:
-                raise safety_error from error
-            raise EquipmentRepairPageError("Unable to open Repair tab") from error
-
-        await self._verify_repair_destination(realm)
-
-    async def _open_armory_from_menu(self, realm: Realm) -> None:
-        try:
-            bazaar = await self.maintenance.select_bazaar(
-                realm,
-                navigate_first=False,
-            )
-        except MaintenanceNavigationBlockedError:
-            raise
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError("Unable to open Bazaar") from error
-
-        try:
-            armory_elements = await wait_for_zendriver(
-                self.page.xpath(
-                    _ARMORY_MENU_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError(
-                "Unable to find The Armory menu entry"
-            ) from error
-        if not armory_elements:
-            raise EquipmentRepairPageError("Unable to find The Armory menu entry")
-
-        armory = armory_elements[0]
-        try:
-            await wait_for_zendriver(
-                bazaar.mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=bazaar,
-            )
-            await self._wait_for_armory_menu(armory)
-            await wait_for_zendriver(
-                armory.mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=armory,
-            )
-            await self.driver.wait(
-                armory.mouse_click,
-                ischangeurl=True,
-                owner=armory,
-                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
-            )
-        except EquipmentRepairPageError:
-            raise
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError("Unable to open The Armory") from error
-
-    async def _wait_for_armory_menu(self, armory: Any) -> None:
-        last_error: Exception | None = None
-        for attempt in range(_ARMORY_MENU_VISIBILITY_ATTEMPTS):
-            try:
-                position = await wait_for_zendriver(
-                    armory.get_position(),
-                    timeout=_READ_TIMEOUT_SECONDS,
-                    owner=armory,
-                )
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                last_error = error
-            else:
-                if position is not None:
-                    return
-
-            if attempt + 1 < _ARMORY_MENU_VISIBILITY_ATTEMPTS:
-                try:
-                    await wait_for_zendriver(
-                        self.page.wait(_ARMORY_MENU_VISIBILITY_INTERVAL_SECONDS),
-                        timeout=_READ_TIMEOUT_SECONDS,
-                        owner=self.page,
-                    )
-                except Exception as error:
-                    if is_browser_generation_error(error):
-                        raise
-                    raise EquipmentRepairPageError(
-                        "Unable to wait for The Armory menu entry"
-                    ) from error
-
-        page_error = EquipmentRepairPageError(
-            "The Armory menu entry did not become visible"
-        )
-        if last_error is None:
-            raise page_error
-        raise page_error from last_error
-
     async def _open_repair_directly(self, realm: Realm) -> None:
-        await self._ensure_navigation_is_safe("before direct Armory navigation")
+        await self._ensure_navigation_is_safe(
+            realm,
+            "before direct Armory navigation",
+        )
         try:
             await self.driver.get(_ARMORY_URLS[realm])
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
             try:
-                await self._ensure_navigation_is_safe("after direct Armory navigation")
+                await self._ensure_navigation_is_safe(
+                    realm,
+                    "after direct Armory navigation",
+                )
             except MaintenanceNavigationBlockedError as blocked:
                 raise blocked from error
             except _EquipmentRepairNavigationSafetyError as safety_error:
@@ -430,45 +286,39 @@ class EquipmentRepairClient:
 
         await self._verify_repair_destination(realm)
 
-    async def _ensure_navigation_is_safe(self, context: str) -> None:
+    async def _ensure_navigation_is_safe(
+        self,
+        realm: Realm,
+        context: str,
+    ) -> MaintenanceNavigationObservation:
         try:
-            blocker = await classify_maintenance_navigation_blocker(self.page)
+            observation = await observe_maintenance_navigation(self.page)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
             raise _EquipmentRepairNavigationSafetyError(
                 f"Unable to verify battle state {context}"
             ) from error
-        if blocker is not None:
-            raise MaintenanceNavigationBlockedError(blocker)
+        if observation.realm is not realm:
+            raise _EquipmentRepairNavigationSafetyError(
+                "Equipment repair navigation is on an untrusted or wrong realm "
+                f"{context}"
+            )
+        expected_path = "/isekai/" if realm is Realm.ISEKAI else "/"
+        if urlsplit(observation.url).path != expected_path:
+            raise _EquipmentRepairNavigationSafetyError(
+                f"Equipment repair navigation is on an unexpected path {context}"
+            )
+        if observation.blocker is not None:
+            raise MaintenanceNavigationBlockedError(observation.blocker)
+        return observation
 
     async def _verify_repair_destination(self, realm: Realm) -> None:
-        await self._ensure_navigation_is_safe("after opening Repair")
-        try:
-            current_url = await wait_for_zendriver(
-                self.page.evaluate("window.location.href"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-            landed_realm = realm_from_url(current_url)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _EquipmentRepairNavigationSafetyError(
-                "Unable to verify the Repair URL"
-            ) from error
-        if landed_realm is not realm:
-            raise _EquipmentRepairNavigationSafetyError(
-                "Repair navigation landed in the wrong realm"
-            )
-        if not isinstance(current_url, str):
-            raise _EquipmentRepairNavigationSafetyError("Repair URL is invalid")
-        parsed_url = urlsplit(current_url)
-        expected_path = "/isekai/" if realm is Realm.ISEKAI else "/"
-        if parsed_url.path != expected_path:
-            raise _EquipmentRepairNavigationSafetyError(
-                "Repair navigation landed on an unexpected path"
-            )
+        observation = await self._ensure_navigation_is_safe(
+            realm,
+            "after opening Repair",
+        )
+        parsed_url = urlsplit(observation.url)
         query = parse_qs(parsed_url.query, keep_blank_values=True)
         expected_query = {
             "s": ["Bazaar"],
@@ -485,24 +335,6 @@ class EquipmentRepairClient:
                 "Repair navigation did not land on the Equipped filter"
             )
         await self._verify_repair_selected()
-
-    async def _find_repair_tab(self) -> Any:
-        try:
-            repair_elements = await wait_for_zendriver(
-                self.page.xpath(
-                    _REPAIR_TAB_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError("Unable to find Repair tab") from error
-        if not repair_elements:
-            raise EquipmentRepairPageError("Unable to find Repair tab")
-        return repair_elements[0]
 
     async def _verify_repair_selected(self) -> None:
         try:

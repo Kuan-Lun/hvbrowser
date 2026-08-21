@@ -11,13 +11,13 @@ from hvbrowser import (
     LotterySnapshot,
     LotteryStateChangedError,
     LotterySubmissionError,
+    MaintenanceNavigationContext,
 )
 from hvbrowser.runtime import ZendriverOperationTimeout
 
 
 def _client(driver: object, **kwargs: Any) -> LotteryClient:
-    navigation = SimpleNamespace(select_bazaar=AsyncMock())
-    return LotteryClient(driver, navigation, **kwargs)  # type: ignore[arg-type]
+    return LotteryClient(driver, **kwargs)  # type: ignore[arg-type]
 
 
 class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
@@ -43,7 +43,10 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         client = _client(driver)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
-        snapshot = await client.inspect(LotteryKind.WEAPON)
+        snapshot = await client.inspect(
+            LotteryKind.WEAPON,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
 
         self.assertEqual(snapshot, LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200))
 
@@ -53,7 +56,10 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(TypeError, "LotteryKind"):
-            await client.inspect("Weapon Lottery")  # type: ignore[arg-type]
+            await client.inspect(  # type: ignore[arg-type]
+                "Weapon Lottery",
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         client._navigate.assert_not_awaited()
 
@@ -73,9 +79,15 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         client._open_directly = AsyncMock()  # type: ignore[method-assign]
 
         with self.assertRaisesRegex(LotteryPageError, "GP balance"):
-            await client.inspect(LotteryKind.ARMOR)
+            await client.inspect(
+                LotteryKind.ARMOR,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
-        client._open_directly.assert_awaited_once_with(LotteryKind.ARMOR)
+        client._open_directly.assert_awaited_once_with(
+            LotteryKind.ARMOR,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
 
     async def test_purchase_rejects_invalid_amount_before_inspection(self) -> None:
         client = _client(SimpleNamespace(page=SimpleNamespace()))
@@ -85,7 +97,9 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(invalid=invalid):
                 with self.assertRaisesRegex(ValueError, "positive integer"):
                     await client.purchase(  # type: ignore[arg-type]
-                        LotteryKind.WEAPON, invalid
+                        LotteryKind.WEAPON,
+                        invalid,
+                        context=MaintenanceNavigationContext.ORDINARY,
                     )
 
         client.inspect.assert_not_awaited()
@@ -103,7 +117,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(ValueError, "Insufficient GP"):
-            await client.purchase(LotteryKind.ARMOR, 800)
+            await client.purchase(
+                LotteryKind.ARMOR,
+                800,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         page.select.assert_not_awaited()
         page.evaluate.assert_not_awaited()
@@ -118,6 +136,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             await client.purchase(
                 LotteryKind.WEAPON,
                 1,
+                context=MaintenanceNavigationContext.ORDINARY,
                 expected_before=object(),  # type: ignore[arg-type]
             )
 
@@ -136,6 +155,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             await client.purchase(
                 LotteryKind.WEAPON,
                 800,
+                context=MaintenanceNavigationContext.ORDINARY,
                 expected_before=expected,
             )
 
@@ -153,7 +173,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(LotteryPageError, "input is missing"):
-            await client.purchase(LotteryKind.WEAPON, 1)
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         page.evaluate.assert_not_awaited()
 
@@ -172,7 +196,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(LotteryPageError, "API is missing"):
-            await client.purchase(LotteryKind.WEAPON, 1)
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         page.evaluate.assert_awaited_once_with("typeof submit_buy === 'function'")
 
@@ -191,7 +219,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(LotterySubmissionError, "outcome is unknown"):
-            await client.purchase(LotteryKind.WEAPON, 1)
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
     async def test_purchase_submit_hang_is_terminal_without_confirmation(self) -> None:
         release = asyncio.Event()
@@ -222,7 +254,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             patch("hvbrowser.lottery._MUTATION_TIMEOUT_SECONDS", 0.01),
             self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
-            await client.purchase(LotteryKind.WEAPON, 1)
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertEqual(raised.exception.timeout_seconds, 0.01)
         client._inspect_current.assert_not_awaited()
@@ -252,6 +288,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             report = await client.purchase(
                 LotteryKind.WEAPON,
                 800,
+                context=MaintenanceNavigationContext.ORDINARY,
                 expected_before=before,
             )
 
@@ -300,6 +337,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             report = await client.purchase(
                 LotteryKind.WEAPON,
                 800,
+                context=MaintenanceNavigationContext.ORDINARY,
                 expected_before=before,
             )
 
@@ -329,7 +367,11 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaises(LotterySubmissionError):
-            await client.purchase(LotteryKind.ARMOR, 800)
+            await client.purchase(
+                LotteryKind.ARMOR,
+                800,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
 
 if __name__ == "__main__":

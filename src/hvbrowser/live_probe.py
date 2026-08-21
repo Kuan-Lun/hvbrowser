@@ -6,6 +6,7 @@ from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
 from .lottery import LotteryKind
+from .maintenance_navigation import MaintenanceNavigationContext
 from .market import MarketCategory, MarketPageError
 from .monster_lab import MonsterLabFeed
 from .realm import Realm
@@ -116,13 +117,19 @@ async def run_live_probe(
                     ticket_price_gp=snapshot.ticket_price_gp,
                 )
                 for snapshot in [
-                    await session.lottery.inspect(kind) for kind in LotteryKind
+                    await session.lottery.inspect(
+                        kind,
+                        context=MaintenanceNavigationContext.ORDINARY,
+                    )
+                    for kind in LotteryKind
                 ]
             )
 
         monster_lab_summary: MonsterLabSummary | None = None
         if inspect_monster_lab and realm is Realm.PERSISTENT:
-            monster_snapshot = await session.monster_lab.inspect()
+            monster_snapshot = await session.monster_lab.inspect(
+                context=MaintenanceNavigationContext.ORDINARY
+            )
             monster_lab_summary = MonsterLabSummary(
                 food_available=(
                     MonsterLabFeed.FOOD in monster_snapshot.available_feed_all

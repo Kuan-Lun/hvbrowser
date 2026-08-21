@@ -10,10 +10,12 @@ from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
-    MaintenanceNavigator,
-    classify_maintenance_navigation_blocker,
+    MaintenanceNavigationBlocker,
+    MaintenanceNavigationContext,
+    MaintenanceNavigationObservation,
+    observe_maintenance_navigation,
 )
-from .realm import Realm, realm_from_url
+from .realm import Realm
 from .runtime import (
     is_browser_generation_error,
     setup_logger,
@@ -86,16 +88,6 @@ class _LotteryDriver(Protocol):
 
     async def get(self, url: str) -> None: ...
 
-    async def wait(
-        self,
-        fun: Any,
-        ischangeurl: bool,
-        sleeptime: int = 1,
-        *,
-        owner: Any,
-        operation_timeout: float,
-    ) -> None: ...
-
 
 def _parse_first_integer(text: str, *, field: str) -> int:
     match = re.search(r"\d[\d,]*", text)
@@ -110,7 +102,6 @@ class LotteryClient:
     def __init__(
         self,
         driver: _LotteryDriver,
-        navigation: MaintenanceNavigator,
         *,
         confirmation_checks: int = 5,
         confirmation_interval: float = 0.5,
@@ -130,7 +121,6 @@ class LotteryClient:
                 "confirmation_interval must be a finite non-negative number"
             )
         self.driver = driver
-        self.navigation = navigation
         self.confirmation_checks = confirmation_checks
         self.confirmation_interval = confirmation_interval
 
@@ -138,11 +128,18 @@ class LotteryClient:
     def page(self) -> Any:
         return self.driver.page
 
-    async def inspect(self, kind: LotteryKind) -> LotterySnapshot:
+    async def inspect(
+        self,
+        kind: LotteryKind,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> LotterySnapshot:
         """Navigate to and inspect one lottery without purchasing tickets."""
         if not isinstance(kind, LotteryKind):
             raise TypeError("kind must be a LotteryKind")
-        await self._navigate(kind)
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
+        await self._navigate(kind, context=context)
         try:
             return await self._inspect_current(kind)
         except LotteryPageError as error:
@@ -154,7 +151,10 @@ class LotteryClient:
                 type(error).__name__,
             )
 
-        await self._open_directly(kind)
+        await self._open_directly(
+            kind,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
         return await self._inspect_current(kind)
 
     async def purchase(
@@ -162,6 +162,7 @@ class LotteryClient:
         kind: LotteryKind,
         amount: int,
         *,
+        context: MaintenanceNavigationContext,
         expected_before: LotterySnapshot | None = None,
     ) -> LotteryPurchaseReport:
         """Purchase exactly ``amount`` tickets and verify tickets and GP."""
@@ -169,12 +170,14 @@ class LotteryClient:
             raise TypeError("kind must be a LotteryKind")
         if not isinstance(amount, int) or isinstance(amount, bool) or amount <= 0:
             raise ValueError("Lottery purchase amount must be a positive integer")
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
         if expected_before is not None and not isinstance(
             expected_before, LotterySnapshot
         ):
             raise TypeError("expected_before must be a LotterySnapshot or None")
 
-        before = await self.inspect(kind)
+        before = await self.inspect(kind, context=context)
         if expected_before is not None and before != expected_before:
             raise LotteryStateChangedError(
                 f"{kind.value} state changed before purchase; inspect and plan again"
@@ -298,95 +301,36 @@ class LotteryClient:
             f"tickets={expected_tickets}, GP={expected_gp}; {detail}"
         ) from last_error
 
-    async def _navigate(self, kind: LotteryKind) -> None:
-        try:
-            await self._open_from_menu(kind)
-            return
-        except MaintenanceNavigationBlockedError:
-            raise
-        except _LotteryNavigationSafetyError:
-            raise
-        except LotteryPageError as error:
-            logger.warning(
-                "Lottery menu navigation did not open the requested page; "
-                "retrying once through the Persistent direct URL: "
-                "kind=%s error_type=%s",
-                kind.value,
-                type(error).__name__,
-            )
+    async def _navigate(
+        self,
+        kind: LotteryKind,
+        *,
+        context: MaintenanceNavigationContext = MaintenanceNavigationContext.ORDINARY,
+    ) -> None:
+        await self._open_directly(kind, context=context)
 
-        await self._open_directly(kind)
-
-    async def _open_from_menu(self, kind: LotteryKind) -> None:
-        try:
-            bazaar = await self.navigation.select_bazaar(
-                Realm.PERSISTENT,
-                navigate_first=True,
-            )
-        except MaintenanceNavigationBlockedError:
-            raise
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise LotteryPageError("Bazaar menu is missing") from error
-
-        route = _LOTTERY_ROUTES[kind]
-        menu_xpath = (
-            "//*[@id='child_Bazaar']"
-            f"//*[@onclick and contains(@onclick, 's=Bazaar') "
-            f"and contains(@onclick, 'ss={route}')]"
-            f" | //*[@id='child_Bazaar']//a[contains(@href, 's=Bazaar') "
-            f"and contains(@href, 'ss={route}')]"
+    async def _open_directly(
+        self,
+        kind: LotteryKind,
+        *,
+        context: MaintenanceNavigationContext = MaintenanceNavigationContext.ORDINARY,
+    ) -> None:
+        await self._ensure_navigation_is_safe(
+            Realm.PERSISTENT,
+            "before direct Lottery navigation",
+            context=context,
         )
-        try:
-            elements = await wait_for_zendriver(
-                self.page.xpath(
-                    menu_xpath,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise LotteryPageError(f"Unable to find {kind.value} menu entry") from error
-        if not elements:
-            raise LotteryPageError(f"Unable to find {kind.value} menu entry")
-
-        try:
-            await wait_for_zendriver(
-                bazaar.mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=bazaar,
-            )
-            await wait_for_zendriver(
-                elements[0].mouse_move(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=elements[0],
-            )
-            await self.driver.wait(
-                elements[0].mouse_click,
-                ischangeurl=True,
-                owner=elements[0],
-                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise LotteryPageError(f"Unable to open {kind.value}") from error
-
-        await self._verify_destination(kind)
-
-    async def _open_directly(self, kind: LotteryKind) -> None:
-        await self._ensure_navigation_is_safe("before direct Lottery navigation")
         try:
             await self.driver.get(_LOTTERY_URLS[kind])
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
             try:
-                await self._ensure_navigation_is_safe("after direct Lottery navigation")
+                await self._ensure_navigation_is_safe(
+                    Realm.PERSISTENT,
+                    "after direct Lottery navigation",
+                    context=MaintenanceNavigationContext.ORDINARY,
+                )
             except MaintenanceNavigationBlockedError as blocked:
                 raise blocked from error
             except _LotteryNavigationSafetyError as safety_error:
@@ -397,44 +341,48 @@ class LotteryClient:
 
         await self._verify_destination(kind)
 
-    async def _ensure_navigation_is_safe(self, context: str) -> None:
+    async def _ensure_navigation_is_safe(
+        self,
+        expected_realm: Realm,
+        phase: str,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> MaintenanceNavigationObservation:
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
         try:
-            blocker = await classify_maintenance_navigation_blocker(self.page)
+            observation = await observe_maintenance_navigation(self.page)
         except Exception as error:
             if is_browser_generation_error(error):
                 raise
             raise _LotteryNavigationSafetyError(
-                f"Unable to verify battle state {context}"
+                f"Unable to verify battle state {phase}"
             ) from error
-        if blocker is not None:
-            raise MaintenanceNavigationBlockedError(blocker)
+        if observation.realm is not expected_realm:
+            raise _LotteryNavigationSafetyError(
+                f"Lottery navigation is on an untrusted or wrong realm {phase}"
+            )
+        expected_path = "/isekai/" if expected_realm is Realm.ISEKAI else "/"
+        if urlsplit(observation.url).path != expected_path:
+            raise _LotteryNavigationSafetyError(
+                f"Lottery navigation is on an unexpected path {phase}"
+            )
+        may_leave_completion = (
+            context is MaintenanceNavigationContext.POST_BATTLE
+            and expected_realm is Realm.PERSISTENT
+            and observation.blocker is MaintenanceNavigationBlocker.COMPLETION
+        )
+        if observation.blocker is not None and not may_leave_completion:
+            raise MaintenanceNavigationBlockedError(observation.blocker)
+        return observation
 
     async def _verify_destination(self, kind: LotteryKind) -> None:
-        await self._ensure_navigation_is_safe(f"after opening {kind.value}")
-        try:
-            current_url = await wait_for_zendriver(
-                self.page.evaluate("window.location.href"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-            landed_realm = realm_from_url(current_url)
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise _LotteryNavigationSafetyError(
-                f"Unable to verify the {kind.value} URL"
-            ) from error
-        if landed_realm is not Realm.PERSISTENT:
-            raise _LotteryNavigationSafetyError(
-                "Lottery navigation landed in the wrong realm"
-            )
-        if not isinstance(current_url, str):
-            raise _LotteryNavigationSafetyError("Lottery URL is invalid")
-        parsed_url = urlsplit(current_url)
-        if parsed_url.path != "/":
-            raise _LotteryNavigationSafetyError(
-                "Lottery navigation landed on an unexpected path"
-            )
+        observation = await self._ensure_navigation_is_safe(
+            Realm.PERSISTENT,
+            f"after opening {kind.value}",
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
+        parsed_url = urlsplit(observation.url)
         query = parse_qs(parsed_url.query, keep_blank_values=True)
         expected_query = {
             "s": ["Bazaar"],

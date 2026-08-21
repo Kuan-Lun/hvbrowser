@@ -6,7 +6,6 @@ from typing import Any, Self
 from .equipment_repair import EquipmentRepairClient
 from .hv import HVDriver
 from .lottery import LotteryClient
-from .maintenance_navigation import MaintenanceNavigator
 from .market import MarketClient
 from .monster_lab import MonsterLabClient
 from .player import PlayerClient
@@ -30,19 +29,14 @@ class HentaiVerseSession:
             )
         self.browser = browser if browser is not None else HVDriver(*args, **kwargs)
         self.realm = RealmNavigator(self.browser)
-        self.maintenance_navigation = MaintenanceNavigator(self.browser, self.realm)
         self.player = PlayerClient(self.browser)
         self.equipment = EquipmentRepairClient(
             self.browser,
             self.realm,
-            self.maintenance_navigation,
         )
         self.market = MarketClient(self.browser, self.realm)
-        self.lottery = LotteryClient(self.browser, self.maintenance_navigation)
-        self.monster_lab = MonsterLabClient(
-            self.browser,
-            self.maintenance_navigation,
-        )
+        self.lottery = LotteryClient(self.browser)
+        self.monster_lab = MonsterLabClient(self.browser)
         self._started = False
 
     async def start(

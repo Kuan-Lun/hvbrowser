@@ -6,6 +6,7 @@ from unittest.mock import AsyncMock, Mock
 
 from hvbrowser.live_probe import _ACTIVE_BATTLE_XPATH, LiveProbeRefused, run_live_probe
 from hvbrowser.lottery import LotteryKind, LotterySnapshot
+from hvbrowser.maintenance_navigation import MaintenanceNavigationContext
 from hvbrowser.market import (
     MarketCategory,
     MarketItem,
@@ -145,11 +146,19 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(
             session.lottery.inspect.await_args_list,
             [
-                unittest.mock.call(LotteryKind.WEAPON),
-                unittest.mock.call(LotteryKind.ARMOR),
+                unittest.mock.call(
+                    LotteryKind.WEAPON,
+                    context=MaintenanceNavigationContext.ORDINARY,
+                ),
+                unittest.mock.call(
+                    LotteryKind.ARMOR,
+                    context=MaintenanceNavigationContext.ORDINARY,
+                ),
             ],
         )
-        session.monster_lab.inspect.assert_awaited_once_with()
+        session.monster_lab.inspect.assert_awaited_once_with(
+            context=MaintenanceNavigationContext.ORDINARY
+        )
         session.market.inspect_sale_quote.assert_awaited_once_with(
             item,
             realm=Realm.PERSISTENT,

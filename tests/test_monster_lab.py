@@ -4,19 +4,19 @@ from collections.abc import Awaitable, Callable
 from unittest.mock import AsyncMock, patch
 
 from hvbrowser import (
-    MaintenanceNavigator,
+    MaintenanceNavigationContext,
     MonsterLabClient,
     MonsterLabFeed,
     MonsterLabPageError,
     MonsterLabSnapshot,
     MonsterLabSubmissionError,
-    RealmNavigator,
 )
 from hvbrowser.runtime import ZendriverOperationTimeout
 
 
-def _maintenance_markers() -> dict[str, bool]:
+def _maintenance_markers(url: str) -> dict[str, object]:
     return {
+        "url": url,
         "challenge": False,
         "completion": False,
         "nextFloor": False,
@@ -101,9 +101,7 @@ class _FakeMonsterLabPage:
     async def evaluate(self, expression: str) -> object:
         self.evaluated.append(expression)
         if "riddlesubmit" in expression and "finishbattle.png" in expression:
-            return _maintenance_markers()
-        if expression == "window.location.href":
-            return self.current_url
+            return _maintenance_markers(self.current_url)
         if expression == "typeof do_feed_all === 'function'":
             return self.has_api
         if self.submission_error is not None:
@@ -156,11 +154,8 @@ def _client(
     confirmation_interval: float = 1,
     sleep=_no_sleep,
 ) -> MonsterLabClient:
-    realm = RealmNavigator(driver)
-    navigation = MaintenanceNavigator(driver, realm)
     return MonsterLabClient(
         driver,
-        navigation,
         confirmation_checks=confirmation_checks,
         confirmation_interval=confirmation_interval,
         sleep=sleep,
@@ -186,49 +181,57 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         page = _FakeMonsterLabPage(set(MonsterLabFeed))
         driver = _FakeMonsterLabDriver(page)
 
-        snapshot = await _client(driver).inspect()
+        snapshot = await _client(driver).inspect(
+            context=MaintenanceNavigationContext.ORDINARY
+        )
 
         self.assertEqual(
             snapshot,
             MonsterLabSnapshot(frozenset(MonsterLabFeed)),
         )
-        self.assertEqual(driver.homepage_calls, [True])
-        self.assertEqual(page.bazaar.mouse_move_count, 1)
-        self.assertEqual(page.menu_entry.mouse_move_count, 1)
-        self.assertEqual(page.menu_entry.mouse_click_count, 1)
+        self.assertEqual(driver.homepage_calls, [])
         self.assertEqual(
-            driver.wait_calls,
-            [(page.menu_entry.mouse_click, True, -1, page.menu_entry, 15.0)],
+            driver.get_calls,
+            ["https://hentaiverse.org/?s=Bazaar&ss=ml"],
         )
+        self.assertEqual(page.bazaar.mouse_move_count, 0)
+        self.assertEqual(page.menu_entry.mouse_move_count, 0)
+        self.assertEqual(page.menu_entry.mouse_click_count, 0)
+        self.assertEqual(driver.wait_calls, [])
         self.assertEqual(page.waited, [])
-        self.assertEqual(len(page.evaluated), 5)
+        self.assertEqual(len(page.evaluated), 3)
         self.assertIn("riddlesubmit", page.evaluated[0])
         self.assertIn("riddlesubmit", page.evaluated[1])
-        self.assertIn("riddlesubmit", page.evaluated[2])
-        self.assertEqual(page.evaluated[3], "window.location.href")
-        self.assertEqual(page.evaluated[4], "typeof do_feed_all === 'function'")
+        self.assertIn("window.location.href", page.evaluated[0])
+        self.assertIn("window.location.href", page.evaluated[1])
+        self.assertEqual(page.evaluated[2], "typeof do_feed_all === 'function'")
 
     async def test_inspect_fails_closed_when_page_api_is_missing(self) -> None:
         page = _FakeMonsterLabPage()
         page.has_api = False
 
         with self.assertRaisesRegex(MonsterLabPageError, "API is missing"):
-            await _client(_FakeMonsterLabDriver(page)).inspect()
+            await _client(_FakeMonsterLabDriver(page)).inspect(
+                context=MaintenanceNavigationContext.ORDINARY
+            )
 
-    async def test_inspect_uses_direct_url_when_menu_is_missing(self) -> None:
+    async def test_inspect_does_not_depend_on_menu_structure(self) -> None:
         page = _FakeMonsterLabPage()
+        page.has_bazaar = False
         page.has_menu_entry = False
         driver = _FakeMonsterLabDriver(page)
 
-        with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
-            snapshot = await _client(driver).inspect()
+        snapshot = await _client(driver).inspect(
+            context=MaintenanceNavigationContext.ORDINARY
+        )
 
         self.assertEqual(snapshot, MonsterLabSnapshot(frozenset()))
         self.assertEqual(
             driver.get_calls,
             ["https://hentaiverse.org/?s=Bazaar&ss=ml"],
         )
-        self.assertIn("retrying once", captured.output[0])
+        self.assertEqual(page.bazaar.mouse_move_count, 0)
+        self.assertEqual(page.menu_entry.mouse_move_count, 0)
 
     async def test_feed_all_returns_noop_without_submitting_when_unavailable(
         self,
@@ -239,7 +242,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
             _FakeMonsterLabDriver(page),
             confirmation_interval=0.01,
             sleep=_no_sleep,
-        ).feed_all(MonsterLabFeed.FOOD)
+        ).feed_all(
+            MonsterLabFeed.FOOD,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
 
         self.assertFalse(report.performed)
         self.assertEqual(report.before, report.after)
@@ -258,7 +264,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 confirmation_checks=2,
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
-            ).feed_all(MonsterLabFeed.FOOD)
+            ).feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertTrue(report.performed)
         self.assertIn(MonsterLabFeed.FOOD, report.before.available_feed_all)
@@ -281,7 +290,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
-            ).feed_all(MonsterLabFeed.DRUGS)
+            ).feed_all(
+                MonsterLabFeed.DRUGS,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
     async def test_feed_all_marks_evaluation_failure_as_unknown(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
@@ -292,7 +304,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
-            ).feed_all(MonsterLabFeed.FOOD)
+            ).feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         submission_scripts = [
             script for script in page.evaluated if 'do_feed_all("food")' in script
@@ -322,7 +337,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
             patch("hvbrowser.monster_lab._MUTATION_TIMEOUT_SECONDS", 0.01),
             self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
-            await client.feed_all(MonsterLabFeed.FOOD)
+            await client.feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertEqual(raised.exception.timeout_seconds, 0.01)
         client._inspect_current.assert_not_awaited()
@@ -340,7 +358,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 confirmation_checks=2,
                 confirmation_interval=0.01,
                 sleep=_no_sleep,
-            ).feed_all(MonsterLabFeed.FOOD)
+            ).feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
     async def test_transient_action_absence_is_not_accepted_as_confirmation(
         self,
@@ -362,7 +383,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(MonsterLabSubmissionError, "Unable to confirm"):
-            await client.feed_all(MonsterLabFeed.FOOD)
+            await client.feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
     async def test_read_error_breaks_consecutive_absence_confirmation(self) -> None:
         page = _FakeMonsterLabPage({MonsterLabFeed.FOOD})
@@ -383,7 +407,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertRaisesRegex(MonsterLabSubmissionError, "Unable to confirm"):
-            await client.feed_all(MonsterLabFeed.FOOD)
+            await client.feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
     async def test_feed_all_warns_once_after_confirmation_read_recovers(
         self,
@@ -407,7 +434,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with self.assertLogs("hvbrowser.monster_lab", level="WARNING") as captured:
-            report = await client.feed_all(MonsterLabFeed.FOOD)
+            report = await client.feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertTrue(report.performed)
         self.assertEqual(len(captured.output), 1)
@@ -429,7 +459,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
                 _FakeMonsterLabDriver(page),
                 confirmation_interval=0.01,
                 sleep=broken_sleep,
-            ).feed_all(MonsterLabFeed.FOOD)
+            ).feed_all(
+                MonsterLabFeed.FOOD,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertIsInstance(raised.exception.__cause__, RuntimeError)
 
@@ -437,7 +470,10 @@ class MonsterLabClientTests(unittest.IsolatedAsyncioTestCase):
         driver = _FakeMonsterLabDriver(_FakeMonsterLabPage())
 
         with self.assertRaisesRegex(TypeError, "MonsterLabFeed"):
-            await _client(driver).feed_all("food")  # type: ignore[arg-type]
+            await _client(driver).feed_all(  # type: ignore[arg-type]
+                "food",
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         self.assertEqual(driver.homepage_calls, [])
 

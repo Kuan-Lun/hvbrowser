@@ -36,8 +36,9 @@ from .lottery import (
 from .maintenance_navigation import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
-    MaintenanceNavigator,
-    classify_maintenance_navigation_blocker,
+    MaintenanceNavigationContext,
+    MaintenanceNavigationObservation,
+    observe_maintenance_navigation,
 )
 from .market import (
     MarketCategory,
@@ -100,7 +101,8 @@ __all__ = [
     "LotterySubmissionError",
     "MaintenanceNavigationBlockedError",
     "MaintenanceNavigationBlocker",
-    "MaintenanceNavigator",
+    "MaintenanceNavigationContext",
+    "MaintenanceNavigationObservation",
     "MarketCategory",
     "MarketClient",
     "MarketItem",
@@ -133,7 +135,7 @@ __all__ = [
     "StaminaRecoveryError",
     "StaminaRecoveryOutcome",
     "StaminaRecoveryReport",
-    "classify_maintenance_navigation_blocker",
+    "observe_maintenance_navigation",
     "realm_from_url",
     "realm_root_url",
 ]

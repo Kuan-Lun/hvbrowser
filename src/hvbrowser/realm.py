@@ -39,10 +39,13 @@ def realm_from_url(url: object) -> Realm:
     parsed = urlsplit(url)
     expected = urlsplit(HENTAIVERSE_ROOT_URL)
     try:
+        parsed_port = parsed.port
+        expected_port = expected.port
         matches_origin = (
             parsed.scheme.casefold() == expected.scheme
             and parsed.hostname == expected.hostname
-            and (parsed.port or 443) == (expected.port or 443)
+            and (443 if parsed_port is None else parsed_port)
+            == (443 if expected_port is None else expected_port)
             and parsed.username is None
             and parsed.password is None
         )

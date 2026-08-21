@@ -127,6 +127,119 @@ class ArchitectureTests(unittest.TestCase):
 
         self.assertEqual(list(source_root.glob("hv_battle*.py")), [])
 
+    def test_maintenance_clients_have_no_menu_navigation_path(self) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
+        client_files = (
+            "equipment_repair.py",
+            "lottery.py",
+            "monster_lab.py",
+        )
+        forbidden_calls = {"get_position", "mouse_move", "select_bazaar"}
+        violations: list[str] = []
+
+        for filename in client_files:
+            source_file = source_root / filename
+            tree = ast.parse(source_file.read_text(), filename=str(source_file))
+            direct_get_count = 0
+            for node in ast.walk(tree):
+                if isinstance(node, ast.AsyncFunctionDef) and node.name.endswith(
+                    "_from_menu"
+                ):
+                    violations.append(f"{filename}:{node.lineno}: menu helper")
+                if not isinstance(node, ast.Call) or not isinstance(
+                    node.func, ast.Attribute
+                ):
+                    continue
+                if node.func.attr in forbidden_calls:
+                    violations.append(
+                        f"{filename}:{node.lineno}: {node.func.attr} navigation"
+                    )
+                if node.func.attr == "get" and _is_driver_receiver(node.func.value):
+                    direct_get_count += 1
+            if direct_get_count != 1:
+                violations.append(
+                    f"{filename}: expected one canonical Driver.get path, "
+                    f"found {direct_get_count}"
+                )
+
+        self.assertEqual(violations, [])
+
+    def test_dead_maintenance_menu_api_is_absent(self) -> None:
+        repository = Path(__file__).parents[1]
+        source_root = repository / "src" / "hvbrowser"
+        maintenance_tree = ast.parse(
+            (source_root / "maintenance_navigation.py").read_text()
+        )
+        forbidden_definitions = {
+            node.name
+            for node in ast.walk(maintenance_tree)
+            if isinstance(node, ast.ClassDef | ast.FunctionDef | ast.AsyncFunctionDef)
+            and node.name
+            in {
+                "MaintenanceNavigator",
+                "classify_maintenance_navigation_blocker",
+            }
+        }
+        self.assertEqual(forbidden_definitions, set())
+
+        session_source = (source_root / "session.py").read_text()
+        package_source = (source_root / "__init__.py").read_text()
+        self.assertNotIn("maintenance_navigation =", session_source)
+        self.assertNotIn('"MaintenanceNavigator"', package_source)
+        self.assertNotIn('"classify_maintenance_navigation_blocker"', package_source)
+
+        constructor_parameters = {
+            "equipment_repair.py": {"driver", "realm"},
+            "lottery.py": {"driver"},
+            "monster_lab.py": {"driver"},
+        }
+        for filename, expected in constructor_parameters.items():
+            tree = ast.parse((source_root / filename).read_text())
+            positional = {
+                argument.arg
+                for node in ast.walk(tree)
+                if isinstance(node, ast.FunctionDef) and node.name == "__init__"
+                for argument in node.args.args
+                if argument.arg != "self"
+            }
+            self.assertEqual(positional, expected, filename)
+
+    def test_persistent_maintenance_context_is_required_by_public_api(self) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
+        required_methods = {
+            "lottery.py": {"inspect", "purchase"},
+            "monster_lab.py": {"inspect", "feed_all"},
+        }
+        violations: list[str] = []
+        for filename, method_names in required_methods.items():
+            tree = ast.parse((source_root / filename).read_text())
+            methods = {
+                node.name: node
+                for node in ast.walk(tree)
+                if isinstance(node, ast.AsyncFunctionDef) and node.name in method_names
+            }
+            for method_name in method_names:
+                method = methods.get(method_name)
+                if method is None:
+                    violations.append(f"{filename}:{method_name}: missing")
+                    continue
+                context_indexes = [
+                    index
+                    for index, argument in enumerate(method.args.kwonlyargs)
+                    if argument.arg == "context"
+                ]
+                if len(context_indexes) != 1:
+                    violations.append(
+                        f"{filename}:{method_name}: context is not keyword-only"
+                    )
+                    continue
+                if method.args.kw_defaults[context_indexes[0]] is not None:
+                    violations.append(
+                        f"{filename}:{method_name}: context has a default"
+                    )
+
+        self.assertEqual(violations, [])
+
     def test_hbrowser_runtime_primitives_only_cross_the_runtime_module(self) -> None:
         source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
         violations: list[str] = []

@@ -14,7 +14,6 @@ HentaiVerse feature has a named component:
 HentaiVerseSession
 ├── browser: HVDriver
 ├── realm: RealmNavigator
-├── maintenance_navigation: MaintenanceNavigator
 ├── player: PlayerClient
 ├── equipment: EquipmentRepairClient
 ├── market: MarketClient
@@ -72,12 +71,16 @@ fixed ticket price. Purchasing requires an explicit kind and positive quantity,
 then verifies the exact ticket increase and GP decrease.
 
 ```python
-from hvbrowser import LotteryKind
+from hvbrowser import LotteryKind, MaintenanceNavigationContext
 
-snapshot = await session.lottery.inspect(LotteryKind.WEAPON)
+snapshot = await session.lottery.inspect(
+    LotteryKind.WEAPON,
+    context=MaintenanceNavigationContext.ORDINARY,
+)
 report = await session.lottery.purchase(
     LotteryKind.WEAPON,
     25,
+    context=MaintenanceNavigationContext.ORDINARY,
     expected_before=snapshot,
 )
 ```
@@ -88,19 +91,42 @@ application policy and do not belong in this package.
 Monster Lab similarly exposes each resource as one atomic operation:
 
 ```python
-from hvbrowser import MonsterLabFeed
+from hvbrowser import MaintenanceNavigationContext, MonsterLabFeed
 
-snapshot = await session.monster_lab.inspect()
-food = await session.monster_lab.feed_all(MonsterLabFeed.FOOD)
-drugs = await session.monster_lab.feed_all(MonsterLabFeed.DRUGS)
+snapshot = await session.monster_lab.inspect(
+    context=MaintenanceNavigationContext.ORDINARY
+)
+food = await session.monster_lab.feed_all(
+    MonsterLabFeed.FOOD,
+    context=MaintenanceNavigationContext.ORDINARY,
+)
+drugs = await session.monster_lab.feed_all(
+    MonsterLabFeed.DRUGS,
+    context=MaintenanceNavigationContext.ORDINARY,
+)
 ```
 
-Lottery, Monster Lab, and equipment repair share one fail-closed
-`MaintenanceNavigator`. An atomic DOM snapshot classifies timed challenge,
-final-completion, next-floor, and active-battle markers before unsafe Bazaar
-interaction. A marker raises `MaintenanceNavigationBlockedError` with a typed
-`blocker`. Marker-free missing Bazaar state permits exactly one same-realm
-retry.
+Lottery, Monster Lab, and equipment repair open canonical realm-scoped URLs
+directly; they do not depend on Bazaar/Armory menu visibility, hover, or click
+behavior. Every operation checks an atomic DOM snapshot before navigation and
+again after landing, then verifies the destination realm, origin, path, query,
+and page structure before reading or mutating state.
+
+The snapshot classifies timed challenge, final-completion, next-floor, and
+active-battle markers. Equipment repair blocks on all four states. Lottery and
+Monster Lab require every public operation to declare a
+`MaintenanceNavigationContext`. `ORDINARY` blocks all four states;
+`POST_BATTLE` may leave an already-observed, trusted Persistent final completion
+only on the operation's initial navigation. It still blocks challenge,
+next-floor, and active states, and any battle marker observed after direct
+navigation blocks all further maintenance.
+
+URL identity and all four marker booleans are read in one atomic browser
+evaluation. Origin, expected realm, and realm root path are trusted before a
+marker can become `MaintenanceNavigationBlockedError`; a marker paired with an
+untrusted origin, wrong realm, or unexpected path is a navigation-safety error.
+A browser-generation failure remains terminal and is never followed by another
+same-browser probe.
 
 ## Market
 

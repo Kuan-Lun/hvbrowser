@@ -1,25 +1,18 @@
-"""Fail-closed navigation shared by HentaiVerse maintenance clients."""
+"""Atomic page identity and battle-state observations for maintenance clients."""
 
+from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol, cast
+from typing import Any, cast
 
-from .realm import Realm, RealmNavigator
-from .runtime import (
-    ZendriverOperationTimeout,
-    setup_logger,
-    wait_for_zendriver,
-)
-
-logger = setup_logger(__name__)
+from .realm import Realm, RealmDetectionError, realm_from_url
+from .runtime import wait_for_zendriver
 
 _MARKER_READ_TIMEOUT_SECONDS = 8.0
-_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
-_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
-
-_MAINTENANCE_MARKERS_SCRIPT = r"""
+_MAINTENANCE_NAVIGATION_OBSERVATION_SCRIPT = r"""
 (() => {
     const completion = document.getElementById("pane_completion");
     return {
+        url: window.location.href,
         challenge: Boolean(document.getElementById("riddlesubmit")),
         completion: Boolean(
             completion
@@ -41,8 +34,28 @@ class MaintenanceNavigationBlocker(StrEnum):
     ACTIVE = "active"
 
 
+class MaintenanceNavigationContext(StrEnum):
+    """Why a client is about to leave its current trusted page."""
+
+    ORDINARY = "ordinary"
+    POST_BATTLE = "post-battle"
+
+
+@dataclass(frozen=True, slots=True)
+class MaintenanceNavigationObservation:
+    """One atomic URL identity and battle-marker observation.
+
+    ``realm`` is ``None`` when ``url`` does not identify a trusted HentaiVerse
+    origin. Callers must validate realm and root path before using ``blocker``.
+    """
+
+    url: str
+    realm: Realm | None
+    blocker: MaintenanceNavigationBlocker | None
+
+
 class MaintenanceNavigationBlockedError(RuntimeError):
-    """Maintenance landed on a battle page and stopped safely."""
+    """Trusted maintenance navigation observed a battle page and stopped."""
 
     def __init__(self, blocker: MaintenanceNavigationBlocker) -> None:
         self.blocker = blocker
@@ -51,120 +64,37 @@ class MaintenanceNavigationBlockedError(RuntimeError):
         )
 
 
-class _MaintenanceDriver(Protocol):
-    page: Any
-
-
-async def classify_maintenance_navigation_blocker(
+async def observe_maintenance_navigation(
     page: Any,
-) -> MaintenanceNavigationBlocker | None:
-    """Read all battle markers atomically and return the highest-risk state."""
+) -> MaintenanceNavigationObservation:
+    """Read and validate page identity and all battle markers atomically."""
     raw: object = await wait_for_zendriver(
-        page.evaluate(_MAINTENANCE_MARKERS_SCRIPT),
+        page.evaluate(_MAINTENANCE_NAVIGATION_OBSERVATION_SCRIPT),
         timeout=_MARKER_READ_TIMEOUT_SECONDS,
         owner=page,
     )
     if not isinstance(raw, dict):
-        raise RuntimeError("Invalid maintenance navigation marker payload")
+        raise RuntimeError("Invalid maintenance navigation observation payload")
     payload = cast(dict[object, object], raw)
+    url = payload.get("url")
+    if not isinstance(url, str):
+        raise RuntimeError("Invalid maintenance navigation observation payload")
     marker_names = ("challenge", "completion", "nextFloor", "active")
     if any(type(payload.get(name)) is not bool for name in marker_names):
-        raise RuntimeError("Invalid maintenance navigation marker payload")
+        raise RuntimeError("Invalid maintenance navigation observation payload")
 
+    blocker: MaintenanceNavigationBlocker | None = None
     if payload["challenge"]:
-        return MaintenanceNavigationBlocker.CHALLENGE
-    if payload["completion"]:
-        return MaintenanceNavigationBlocker.COMPLETION
-    if payload["nextFloor"]:
-        return MaintenanceNavigationBlocker.NEXT_FLOOR
-    if payload["active"]:
-        return MaintenanceNavigationBlocker.ACTIVE
-    return None
+        blocker = MaintenanceNavigationBlocker.CHALLENGE
+    elif payload["completion"]:
+        blocker = MaintenanceNavigationBlocker.COMPLETION
+    elif payload["nextFloor"]:
+        blocker = MaintenanceNavigationBlocker.NEXT_FLOOR
+    elif payload["active"]:
+        blocker = MaintenanceNavigationBlocker.ACTIVE
 
-
-def _blocked_error(
-    blocker: MaintenanceNavigationBlocker | None,
-) -> MaintenanceNavigationBlockedError | None:
-    return MaintenanceNavigationBlockedError(blocker) if blocker is not None else None
-
-
-class MaintenanceNavigator:
-    """Open Bazaar with realm-aware navigation and one safe retry."""
-
-    def __init__(
-        self,
-        driver: _MaintenanceDriver,
-        realm_navigator: RealmNavigator,
-    ) -> None:
-        self._driver = driver
-        self._realm = realm_navigator
-
-    async def select_bazaar(
-        self,
-        realm: Realm,
-        *,
-        navigate_first: bool,
-    ) -> Any:
-        if not isinstance(realm, Realm):
-            raise TypeError("realm must be a Realm")
-        if not isinstance(navigate_first, bool):
-            raise TypeError("navigate_first must be bool")
-
-        last_missing_error: TimeoutError | None = None
-        for attempt in range(2):
-            blocker = await classify_maintenance_navigation_blocker(self._driver.page)
-            may_leave_completion = (
-                navigate_first
-                and attempt == 0
-                and blocker is MaintenanceNavigationBlocker.COMPLETION
-            )
-            if blocker is not None and not may_leave_completion:
-                raise MaintenanceNavigationBlockedError(blocker)
-
-            if navigate_first or attempt > 0:
-                await self._realm.go_home(realm, force=True)
-                blocker_error = _blocked_error(
-                    await classify_maintenance_navigation_blocker(self._driver.page)
-                )
-                if blocker_error is not None:
-                    raise blocker_error
-
-            try:
-                bazaar = await wait_for_zendriver(
-                    self._driver.page.select(
-                        "#parent_Bazaar",
-                        timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                    ),
-                    timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                    owner=self._driver.page,
-                )
-            except ZendriverOperationTimeout:
-                raise
-            except TimeoutError as error:
-                blocker_error = _blocked_error(
-                    await classify_maintenance_navigation_blocker(self._driver.page)
-                )
-                if blocker_error is not None:
-                    raise blocker_error from error
-                last_missing_error = error
-            else:
-                if bazaar is not None:
-                    return bazaar
-                blocker_error = _blocked_error(
-                    await classify_maintenance_navigation_blocker(self._driver.page)
-                )
-                if blocker_error is not None:
-                    raise blocker_error
-                last_missing_error = TimeoutError(
-                    "Bazaar menu selection returned no element"
-                )
-
-            if attempt == 0:
-                logger.warning(
-                    "Bazaar menu is unavailable without battle markers; "
-                    "reloading the same maintenance realm and retrying once"
-                )
-
-        if last_missing_error is None:
-            raise RuntimeError("Maintenance navigation ended without a result")
-        raise last_missing_error
+    try:
+        realm = realm_from_url(url)
+    except RealmDetectionError:
+        realm = None
+    return MaintenanceNavigationObservation(url, realm, blocker)
