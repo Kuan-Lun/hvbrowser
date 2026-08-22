@@ -10,3 +10,9 @@ directory.
 - After changing Markdown, run `bash scripts/hooks/finalize-markdown.sh`.
 - Keep the committed dependency source for `hbrowser` on PyPI. Install a local
   editable checkout manually only after rebuilding the environment.
+
+## Git Workflow
+
+- Do not create or switch to a development branch.
+- Perform all development work directly on the repository's primary branch
+  (`main`).
