@@ -9,6 +9,8 @@ only establishes and enforces the browser/realm ownership boundary.
 from __future__ import annotations
 
 import asyncio
+import math
+import time
 from collections.abc import Awaitable, Callable, Collection
 from enum import StrEnum
 from functools import partial
@@ -18,6 +20,8 @@ from hbrowser.gallery.browser import (
     BrowserCloser,
     BrowserFactory,
     BrowserOwner,
+    BrowserOwnershipError,
+    ProcessOwnershipError,
     TabFactory,
     TabHandle,
     TabNavigator,
@@ -30,6 +34,8 @@ from hbrowser.gallery.browser import (
 from .hv import HVDriver
 from .realm import Realm, RealmDetectionError, realm_from_url
 from .runtime import (
+    PROTOCOL_COMMAND_TIMEOUT_SECONDS,
+    BrowserOwnershipDeadline,
     is_browser_generation_error,
     log_context,
     wait_for_zendriver,
@@ -42,7 +48,7 @@ type BoundDriverFactory[TabT] = Callable[
 ]
 type CurrentUrlReader[TabT] = Callable[[TabT], Awaitable[object]]
 
-_CURRENT_URL_TIMEOUT_SECONDS = 8.0
+_ACCOUNT_CLOSE_TIMEOUT_SECONDS = 20.0
 _ACCOUNT_LOGIN_LOG_SCOPE = "Account · Login"
 
 
@@ -60,6 +66,14 @@ class AccountContextStateError(AccountContextError):
 
 class AccountContextStartupStopped(AccountContextError):
     """Account startup reached a safe boundary after a stop request."""
+
+
+class AccountContextCloseTimeout(
+    AccountContextError,
+    ProcessOwnershipError,
+    TimeoutError,
+):
+    """Account browser ownership remains unresolved after bounded cleanup."""
 
 
 class RealmTabBindingError(AccountContextError):
@@ -262,12 +276,12 @@ class RealmRuntime[TabT]:
                     page = cast(Any, tab)
                     return await wait_for_zendriver(
                         page.evaluate("window.location.href"),
-                        timeout=_CURRENT_URL_TIMEOUT_SECONDS,
+                        timeout=PROTOCOL_COMMAND_TIMEOUT_SECONDS,
                         owner=page,
                     )
                 return await wait_for_zendriver(
                     reader(tab),
-                    timeout=_CURRENT_URL_TIMEOUT_SECONDS,
+                    timeout=PROTOCOL_COMMAND_TIMEOUT_SECONDS,
                     owner=tab,
                 )
 
@@ -328,8 +342,7 @@ class RealmRuntime[TabT]:
                     f"{type(restore_error).__name__}"
                 )
             raise RealmBindingViolationError(
-                f"operation left the {self._realm.value} realm tab outside its "
-                "binding"
+                f"operation left the {self._realm.value} realm tab outside its binding"
             ) from drift_error
 
     async def execute[ResultT](
@@ -504,6 +517,8 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         self._state = AccountContextState.NEW
         self._lifecycle_lock = asyncio.Lock()
         self._close_task: asyncio.Task[None] | None = None
+        self._close_deadline: float | None = None
+        self._close_timeout_seconds: float | None = None
 
     @property
     def state(self) -> AccountContextState:
@@ -580,51 +595,240 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
         if stop_requested():
             raise AccountContextStartupStopped
 
-    def _ensure_close_task(self) -> asyncio.Task[None]:
+    @staticmethod
+    def _bounded_close_deadline(deadline_at: float | None = None) -> float:
+        if deadline_at is not None and (
+            isinstance(deadline_at, bool)
+            or not isinstance(deadline_at, int | float)
+            or not math.isfinite(deadline_at)
+        ):
+            raise ValueError("deadline_at must be a finite monotonic deadline")
+        started_at = time.monotonic()
+        local_deadline_at = started_at + _ACCOUNT_CLOSE_TIMEOUT_SECONDS
+        return (
+            local_deadline_at
+            if deadline_at is None
+            else min(float(deadline_at), local_deadline_at)
+        )
+
+    @staticmethod
+    def _raise_close_timeout(message: str) -> None:
+        raise AccountContextCloseTimeout(message)
+
+    async def _acquire_lifecycle_for_close(self, *, deadline_at: float) -> None:
+        remaining = deadline_at - time.monotonic()
+        if remaining <= 0:
+            self._raise_close_timeout(
+                "Account close deadline expired before lifecycle ownership"
+            )
+        try:
+            async with asyncio.timeout(remaining):
+                await self._lifecycle_lock.acquire()
+        except TimeoutError as error:
+            raise AccountContextCloseTimeout(
+                "Account close deadline expired while waiting for lifecycle ownership"
+            ) from error
+        if time.monotonic() >= deadline_at:
+            self._lifecycle_lock.release()
+            self._raise_close_timeout(
+                "Account close deadline expired while waiting for lifecycle ownership"
+            )
+
+    def _ensure_close_task(
+        self,
+        *,
+        deadline_at: float,
+    ) -> asyncio.Task[None]:
         task = self._close_task
-        if task is not None and task.done():
-            if not task.cancelled():
-                task.exception()
-            self._close_task = None
-            task = None
         if task is None:
-            task = asyncio.create_task(self._owner.close())
+            started_at = time.monotonic()
+            self._close_timeout_seconds = max(
+                0.0,
+                deadline_at - started_at,
+            )
+            self._close_deadline = deadline_at
+            # Bind every deadline field before task creation so eager task
+            # factories cannot start owner cleanup against incomplete state.
+            task = asyncio.create_task(
+                self._owner.close(deadline=BrowserOwnershipDeadline(deadline_at))
+            )
+            task.add_done_callback(self._observe_close_task)
             self._close_task = task
         return task
 
-    def _record_close_attempt(self, cleanup_error: BaseException | None) -> None:
-        """Expose failed owner cleanup as retriable instead of terminal."""
+    @staticmethod
+    def _observe_close_task(task: asyncio.Task[None]) -> None:
+        """Retrieve detached cleanup failures without consuming later result()."""
 
-        self._close_task = None
+        if not task.cancelled():
+            task.exception()
+
+    def _record_close_attempt(
+        self,
+        task: asyncio.Task[None],
+        cleanup_error: BaseException | None,
+    ) -> None:
+        """Retain running cleanup; let a completed ownership failure be retried."""
+
+        if self._close_task is not task:
+            return
+        if task.done():
+            self._close_task = None
+            self._close_deadline = None
+            self._close_timeout_seconds = None
         self._state = (
             AccountContextState.CLOSED
             if cleanup_error is None
             else AccountContextState.CLOSING
         )
 
-    @staticmethod
+    def _reconcile_completed_close_attempt(self) -> None:
+        """Retire a finished generation before an explicit close retry."""
+
+        task = self._close_task
+        if task is None or not task.done():
+            return
+        cleanup_error: BaseException | None
+        if task.cancelled():
+            cleanup_error = AccountContextCloseTimeout(
+                "Account browser cleanup task was cancelled before ownership proof"
+            )
+        else:
+            cleanup_error = task.exception()
+        self._record_close_attempt(task, cleanup_error)
+
     async def _wait_for_close_task(
+        self,
         task: asyncio.Task[None],
+        *,
+        caller_deadline_at: float,
+        shared_deadline_at: float,
+        shared_timeout_seconds: float,
     ) -> tuple[BaseException | None, asyncio.CancelledError | None]:
         """Wait for shared cleanup while postponing caller cancellation."""
 
         delayed_cancellation: asyncio.CancelledError | None = None
+        deadline = min(shared_deadline_at, caller_deadline_at)
         while not task.done():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return (
+                    AccountContextCloseTimeout(
+                        "Account browser ownership remains unresolved after "
+                        f"{shared_timeout_seconds:g} seconds"
+                    ),
+                    delayed_cancellation,
+                )
             try:
-                await asyncio.shield(task)
+                done, _ = await asyncio.wait((task,), timeout=remaining)
+                if not done:
+                    return (
+                        AccountContextCloseTimeout(
+                            "Account browser ownership remains unresolved after "
+                            f"{shared_timeout_seconds:g} seconds"
+                        ),
+                        delayed_cancellation,
+                    )
             except asyncio.CancelledError as error:
                 if delayed_cancellation is None:
                     delayed_cancellation = error
-            except BaseException:
-                # The completed task is inspected exactly once below so cleanup
-                # failures can update the retriable lifecycle state first.
-                pass
 
+        if time.monotonic() >= deadline:
+            return (
+                AccountContextCloseTimeout(
+                    "Account browser ownership remains unresolved because cleanup "
+                    "was reported only after "
+                    f"the {shared_timeout_seconds:g}-second deadline"
+                ),
+                delayed_cancellation,
+            )
         try:
             task.result()
+        except BrowserOwnershipError as error:
+            timeout = AccountContextCloseTimeout(
+                "Account browser ownership remains unresolved after "
+                f"{shared_timeout_seconds:g} seconds"
+            )
+            timeout.__cause__ = error
+            return timeout, delayed_cancellation
         except BaseException as error:
             return error, delayed_cancellation
         return None, delayed_cancellation
+
+    async def _settle_expired_close_attempt(
+        self,
+        *,
+        caller_deadline_at: float,
+    ) -> bool:
+        """Settle an older expired task before retrying owner cleanup.
+
+        The task below already received the old absolute deadline.  A later
+        explicit ``close`` call may give its cancellation/failure path time to
+        finish, but must not start a second owner close concurrently.  Once the
+        old task is terminal, its failed attempt is retired and the caller can
+        retry with the time still left on its own deadline.
+        """
+
+        await self._acquire_lifecycle_for_close(deadline_at=caller_deadline_at)
+        try:
+            self._reconcile_completed_close_attempt()
+            if self._state is AccountContextState.CLOSED:
+                return True
+            task = self._close_task
+            shared_deadline_at = self._close_deadline
+            if (
+                task is None
+                or shared_deadline_at is None
+                or shared_deadline_at > time.monotonic()
+            ):
+                return False
+        finally:
+            self._lifecycle_lock.release()
+
+        settlement_started_at = time.monotonic()
+        settlement_timeout_seconds = max(
+            0.0,
+            caller_deadline_at - settlement_started_at,
+        )
+        cleanup_error, delayed_cancellation = await self._wait_for_close_task(
+            task,
+            caller_deadline_at=caller_deadline_at,
+            shared_deadline_at=caller_deadline_at,
+            shared_timeout_seconds=settlement_timeout_seconds,
+        )
+
+        try:
+            await self._acquire_lifecycle_for_close(deadline_at=caller_deadline_at)
+        except AccountContextCloseTimeout as record_timeout:
+            if cleanup_error is None:
+                cleanup_error = record_timeout
+        else:
+            try:
+                self._record_close_attempt(task, cleanup_error)
+            finally:
+                self._lifecycle_lock.release()
+
+        if delayed_cancellation is not None:
+            if cleanup_error is not None:
+                delayed_cancellation.add_note(
+                    "account browser cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+            if isinstance(cleanup_error, ProcessOwnershipError):
+                cleanup_error.add_note(
+                    "account close cancellation was postponed while settling "
+                    "an expired browser cleanup attempt"
+                )
+                raise cleanup_error from delayed_cancellation
+            raise delayed_cancellation from None
+        if not task.done():
+            if cleanup_error is None:
+                cleanup_error = AccountContextCloseTimeout(
+                    "Account browser ownership remains unresolved while settling "
+                    "an expired cleanup attempt"
+                )
+            raise cleanup_error
+        return cleanup_error is None
 
     async def start(
         self,
@@ -677,43 +881,102 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
                         runtimes[Realm.ISEKAI] = isekai
                 except BaseException as startup_error:
                     self._state = AccountContextState.CLOSING
-                    cleanup_error, delayed_cancellation = (
-                        await self._wait_for_close_task(self._ensure_close_task())
+                    close_deadline_at = self._bounded_close_deadline()
+                    close_task = self._ensure_close_task(deadline_at=close_deadline_at)
+                    shared_deadline_at = self._close_deadline
+                    shared_timeout_seconds = self._close_timeout_seconds
+                    if shared_deadline_at is None or shared_timeout_seconds is None:
+                        raise AccountContextStateError(
+                            "close task has no ownership deadline"
+                        )
+                    (
+                        cleanup_error,
+                        delayed_cancellation,
+                    ) = await self._wait_for_close_task(
+                        close_task,
+                        caller_deadline_at=close_deadline_at,
+                        shared_deadline_at=shared_deadline_at,
+                        shared_timeout_seconds=shared_timeout_seconds,
                     )
-                    self._record_close_attempt(cleanup_error)
+                    self._record_close_attempt(close_task, cleanup_error)
                     if cleanup_error is not None:
                         startup_error.add_note(
                             "account browser cleanup also failed: "
                             f"{type(cleanup_error).__name__}"
                         )
                     if delayed_cancellation is not None:
+                        if isinstance(cleanup_error, ProcessOwnershipError):
+                            cleanup_error.add_note(
+                                "account startup cancellation was postponed during "
+                                "unresolved browser cleanup"
+                            )
+                            raise cleanup_error from delayed_cancellation
                         raise delayed_cancellation from None
+                    if isinstance(cleanup_error, ProcessOwnershipError):
+                        cleanup_error.add_note(
+                            "account startup also failed: "
+                            f"{type(startup_error).__name__}"
+                        )
+                        raise cleanup_error from startup_error
                     raise
 
                 self._runtimes = runtimes
                 self._state = AccountContextState.OPEN
                 return self
 
-    async def close(self) -> None:
+    async def close(self, *, deadline_at: float | None = None) -> None:
         """Close the owner, postponing caller cancellation until it finishes."""
 
-        async with self._lifecycle_lock:
+        close_deadline_at = self._bounded_close_deadline(deadline_at)
+        if await self._settle_expired_close_attempt(
+            caller_deadline_at=close_deadline_at
+        ):
+            return
+        await self._acquire_lifecycle_for_close(deadline_at=close_deadline_at)
+        try:
+            self._reconcile_completed_close_attempt()
             if self._state is AccountContextState.CLOSED:
                 return
             self._state = AccountContextState.CLOSING
-            cleanup_error, delayed_cancellation = await self._wait_for_close_task(
-                self._ensure_close_task()
-            )
-            self._record_close_attempt(cleanup_error)
-            if delayed_cancellation is not None:
-                if cleanup_error is not None:
-                    delayed_cancellation.add_note(
-                        "account browser cleanup also failed: "
-                        f"{type(cleanup_error).__name__}"
-                    )
-                raise delayed_cancellation from None
+            close_task = self._ensure_close_task(deadline_at=close_deadline_at)
+            shared_deadline_at = self._close_deadline
+            shared_timeout_seconds = self._close_timeout_seconds
+            if shared_deadline_at is None or shared_timeout_seconds is None:
+                raise AccountContextStateError("close task has no ownership deadline")
+        finally:
+            self._lifecycle_lock.release()
+
+        cleanup_error, delayed_cancellation = await self._wait_for_close_task(
+            close_task,
+            caller_deadline_at=close_deadline_at,
+            shared_deadline_at=shared_deadline_at,
+            shared_timeout_seconds=shared_timeout_seconds,
+        )
+        try:
+            await self._acquire_lifecycle_for_close(deadline_at=close_deadline_at)
+        except AccountContextCloseTimeout as record_timeout:
+            if cleanup_error is None:
+                cleanup_error = record_timeout
+        else:
+            try:
+                self._record_close_attempt(close_task, cleanup_error)
+            finally:
+                self._lifecycle_lock.release()
+        if delayed_cancellation is not None:
             if cleanup_error is not None:
-                raise cleanup_error
+                delayed_cancellation.add_note(
+                    "account browser cleanup also failed: "
+                    f"{type(cleanup_error).__name__}"
+                )
+            if isinstance(cleanup_error, ProcessOwnershipError):
+                cleanup_error.add_note(
+                    "account close cancellation was postponed during unresolved "
+                    "browser cleanup"
+                )
+                raise cleanup_error from delayed_cancellation
+            raise delayed_cancellation from None
+        if cleanup_error is not None:
+            raise cleanup_error
 
     async def __aenter__(self) -> Self:
         return await self.start()
@@ -731,6 +994,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
 __all__ = [
     "AccountAuthenticator",
     "AccountContextError",
+    "AccountContextCloseTimeout",
     "AccountContextState",
     "AccountContextStateError",
     "AccountContextStartupStopped",

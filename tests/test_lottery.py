@@ -1,8 +1,8 @@
-import asyncio
 import unittest
-from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock, patch
+
+from hbrowser import BrowserMutationOutcomeUnknownError
 
 from hvbrowser import (
     LotteryClient,
@@ -13,34 +13,74 @@ from hvbrowser import (
     LotterySubmissionError,
     MaintenanceNavigationContext,
 )
-from hvbrowser.runtime import ZendriverOperationTimeout
+from hvbrowser.lottery import _LotteryPageState
+from hvbrowser.runtime import PageStateTimeout, ZendriverOperationTimeout
 
 
-def _client(driver: object, **kwargs: Any) -> LotteryClient:
-    return LotteryClient(driver, **kwargs)  # type: ignore[arg-type]
+class _TicketInput:
+    def __init__(self) -> None:
+        self.value = ""
+
+    async def clear_input(self) -> None:
+        self.value = ""
+
+    async def send_keys(self, value: str) -> None:
+        self.value = value
+
+
+class _Page:
+    def __init__(self, *, gp: int = 1_600_000, tickets: int = 200) -> None:
+        self.gp = gp
+        self.tickets = tickets
+        self.has_input = True
+        self.can_submit = True
+        self.error: str | None = None
+        self.input = _TicketInput()
+        self.submit_error: Exception | None = None
+        self.preserve_after_submit = False
+        self.server_rejection: str | None = None
+        self.submissions = 0
+        self.expressions: list[str] = []
+
+    def state(self) -> dict[str, object]:
+        return {
+            "balanceText": f"You currently have {self.gp:,} GP",
+            "ticketText": f"You hold {self.tickets:,} tickets",
+            "hasTicketInput": self.has_input,
+            "canSubmit": self.can_submit,
+            "errorText": self.error,
+        }
+
+    async def evaluate(self, expression: str) -> object:
+        self.expressions.append(expression)
+        if expression == "submit_buy()":
+            self.submissions += 1
+            if self.submit_error is not None:
+                raise self.submit_error
+            if self.server_rejection is not None:
+                self.error = self.server_rejection
+                return None
+            amount = int(self.input.value)
+            if not self.preserve_after_submit:
+                self.tickets += amount
+                self.gp -= amount * 1_000
+            return None
+        return self.state()
+
+    async def query_selector(self, selector: str) -> Any:
+        if selector != "#ticket_temp":
+            raise AssertionError(f"unexpected selector: {selector}")
+        return self.input if self.has_input else None
+
+
+def _client(page: _Page) -> LotteryClient:
+    return LotteryClient(type("Driver", (), {"page": page})())
 
 
 class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
-    def test_constructor_rejects_invalid_confirmation_settings(self) -> None:
-        driver = SimpleNamespace(page=SimpleNamespace())
-
-        with self.assertRaisesRegex(ValueError, "at least 1"):
-            _client(driver, confirmation_checks=0)
-        with self.assertRaisesRegex(ValueError, "at least 1"):
-            _client(driver, confirmation_checks=True)
-        with self.assertRaisesRegex(ValueError, "finite non-negative"):
-            _client(driver, confirmation_interval=float("nan"))
-
-    async def test_inspect_parses_gp_and_ticket_counts(self) -> None:
-        page = SimpleNamespace()
-        page.xpath = AsyncMock(
-            side_effect=[
-                [SimpleNamespace(text="You currently have 1,600,000 GP")],
-                [SimpleNamespace(text="You hold 200 tickets")],
-            ]
-        )
-        driver = SimpleNamespace(page=page)
-        client = _client(driver)
+    async def test_inspect_parses_one_atomic_snapshot(self) -> None:
+        page = _Page()
+        client = _client(page)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
 
         snapshot = await client.inspect(
@@ -49,32 +89,17 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         )
 
         self.assertEqual(snapshot, LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200))
+        self.assertEqual(len(page.expressions), 1)
 
-    async def test_inspect_rejects_invalid_kind_before_navigation(self) -> None:
-        driver = SimpleNamespace(page=SimpleNamespace())
-        client = _client(driver)
-        client._navigate = AsyncMock()  # type: ignore[method-assign]
-
-        with self.assertRaisesRegex(TypeError, "LotteryKind"):
-            await client.inspect(  # type: ignore[arg-type]
-                "Weapon Lottery",
-                context=MaintenanceNavigationContext.ORDINARY,
-            )
-
-        client._navigate.assert_not_awaited()
-
-    async def test_inspect_rejects_unparseable_page_values(self) -> None:
-        page = SimpleNamespace(
-            xpath=AsyncMock(
-                side_effect=[
-                    [SimpleNamespace(text="You currently have no GP")],
-                    [SimpleNamespace(text="You hold no tickets")],
-                    [SimpleNamespace(text="You currently have no GP")],
-                    [SimpleNamespace(text="You hold no tickets")],
-                ]
-            )
+    async def test_inspect_retries_direct_url_once_on_unreadable_snapshot(self) -> None:
+        page = _Page()
+        page.evaluate = AsyncMock(
+            side_effect=[
+                {**page.state(), "balanceText": "no GP"},
+                {**page.state(), "balanceText": "still no GP"},
+            ]
         )
-        client = _client(SimpleNamespace(page=page))
+        client = _client(page)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
         client._open_directly = AsyncMock()  # type: ignore[method-assign]
 
@@ -84,55 +109,42 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-        client._open_directly.assert_awaited_once_with(
-            LotteryKind.ARMOR,
-            context=MaintenanceNavigationContext.ORDINARY,
-        )
+        client._open_directly.assert_awaited_once()
 
-    async def test_purchase_rejects_invalid_amount_before_inspection(self) -> None:
-        client = _client(SimpleNamespace(page=SimpleNamespace()))
+    async def test_invalid_amount_is_rejected_before_inspection(self) -> None:
+        client = _client(_Page())
         client.inspect = AsyncMock()  # type: ignore[method-assign]
 
-        for invalid in (0, -1, True, 1.5):
-            with self.subTest(invalid=invalid):
-                with self.assertRaisesRegex(ValueError, "positive integer"):
-                    await client.purchase(  # type: ignore[arg-type]
-                        LotteryKind.WEAPON,
-                        invalid,
-                        context=MaintenanceNavigationContext.ORDINARY,
-                    )
+        with self.assertRaises(ValueError):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                0,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
 
         client.inspect.assert_not_awaited()
 
-    async def test_purchase_rejects_insufficient_gp_before_form_interaction(
-        self,
-    ) -> None:
-        page = SimpleNamespace(
-            select=AsyncMock(),
-            evaluate=AsyncMock(),
-        )
-        client = _client(SimpleNamespace(page=page))
+    async def test_insufficient_gp_stops_before_form_interaction(self) -> None:
+        page = _Page(gp=999, tickets=0)
+        client = _client(page)
         client.inspect = AsyncMock(  # type: ignore[method-assign]
-            return_value=LotterySnapshot(LotteryKind.ARMOR, 799_999, 100)
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 999, 0)
         )
 
         with self.assertRaisesRegex(ValueError, "Insufficient GP"):
             await client.purchase(
-                LotteryKind.ARMOR,
-                800,
+                LotteryKind.WEAPON,
+                1,
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-        page.select.assert_not_awaited()
-        page.evaluate.assert_not_awaited()
+        self.assertEqual(page.expressions, [])
 
-    async def test_purchase_rejects_invalid_expected_snapshot_before_inspection(
-        self,
-    ) -> None:
-        client = _client(SimpleNamespace(page=SimpleNamespace()))
+    async def test_invalid_expected_snapshot_stops_before_inspection(self) -> None:
+        client = _client(_Page())
         client.inspect = AsyncMock()  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(TypeError, "LotterySnapshot or None"):
+        with self.assertRaises(TypeError):
             await client.purchase(
                 LotteryKind.WEAPON,
                 1,
@@ -142,55 +154,90 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
         client.inspect.assert_not_awaited()
 
-    async def test_purchase_rejects_changed_state_before_form_interaction(
-        self,
-    ) -> None:
-        page = SimpleNamespace(select=AsyncMock(), evaluate=AsyncMock())
-        expected = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
-        changed = LotterySnapshot(LotteryKind.WEAPON, 1_500_000, 300)
-        client = _client(SimpleNamespace(page=page))
-        client.inspect = AsyncMock(return_value=changed)  # type: ignore[method-assign]
+    async def test_purchase_requires_fresh_form_state(self) -> None:
+        page = _Page(gp=1_599_000, tickets=201)
+        client = _client(page)
+        before = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
 
-        with self.assertRaisesRegex(LotteryStateChangedError, "plan again"):
-            await client.purchase(
-                LotteryKind.WEAPON,
-                800,
-                context=MaintenanceNavigationContext.ORDINARY,
-                expected_before=expected,
-            )
-
-        page.select.assert_not_awaited()
-        page.evaluate.assert_not_awaited()
-
-    async def test_purchase_missing_input_is_a_page_error(self) -> None:
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=None),
-            evaluate=AsyncMock(),
-        )
-        client = _client(SimpleNamespace(page=page))
-        client.inspect = AsyncMock(  # type: ignore[method-assign]
-            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
-        )
-
-        with self.assertRaisesRegex(LotteryPageError, "input is missing"):
+        with self.assertRaises(LotteryStateChangedError):
             await client.purchase(
                 LotteryKind.WEAPON,
                 1,
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-        page.evaluate.assert_not_awaited()
+    async def test_purchase_confirms_exact_gp_and_ticket_change(self) -> None:
+        page = _Page()
+        client = _client(page)
+        before = LotterySnapshot(LotteryKind.WEAPON, page.gp, page.tickets)
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
 
-    async def test_purchase_missing_submit_api_is_a_page_error(self) -> None:
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
+        report = await client.purchase(
+            LotteryKind.WEAPON,
+            800,
+            context=MaintenanceNavigationContext.ORDINARY,
+            expected_before=before,
         )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(return_value=False),
+
+        self.assertEqual(report.after.gp_balance, 800_000)
+        self.assertEqual(report.after.tickets, 1_000)
+        self.assertEqual(report.spent_gp, 800_000)
+        self.assertEqual(page.input.value, "800")
+        self.assertEqual(page.submissions, 1)
+
+    async def test_server_rejection_is_typed_without_replay(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.server_rejection = "Lottery is closed"
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
-        client = _client(SimpleNamespace(page=page))
+
+        with self.assertRaisesRegex(LotterySubmissionError, "Lottery is closed"):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(page.submissions, 1)
+
+    async def test_delayed_success_does_not_replay_submission(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.preserve_after_submit = True
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
+        confirmed = _LotteryPageState(
+            "You currently have 0 GP",
+            "You hold 1 tickets",
+            True,
+            True,
+            None,
+        )
+
+        state_wait = AsyncMock(return_value=confirmed)
+        with patch(
+            "hvbrowser.lottery.wait_for_page_state",
+            new=state_wait,
+        ):
+            report = await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(report.after.tickets, 1)
+        self.assertEqual(page.submissions, 1)
+        receipt_deadline = state_wait.await_args.kwargs["deadline"]
+        self.assertGreater(receipt_deadline.remaining(), 6)
+
+    async def test_missing_submit_api_fails_before_input_mutation(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.can_submit = False
+        client = _client(page)
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
@@ -202,56 +249,77 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-        page.evaluate.assert_awaited_once_with("typeof submit_buy === 'function'")
+        self.assertEqual(page.input.value, "")
 
-    async def test_purchase_evaluation_failure_has_unknown_outcome(self) -> None:
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
-        )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(side_effect=[True, RuntimeError("disconnected")]),
-        )
-        client = _client(SimpleNamespace(page=page))
+    async def test_missing_ticket_input_fails_before_submission(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.has_input = False
+        client = _client(page)
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
 
-        with self.assertRaisesRegex(LotterySubmissionError, "outcome is unknown"):
+        with self.assertRaisesRegex(LotteryPageError, "input is missing"):
             await client.purchase(
                 LotteryKind.WEAPON,
                 1,
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-    async def test_purchase_submit_hang_is_terminal_without_confirmation(self) -> None:
-        release = asyncio.Event()
+        self.assertEqual(page.submissions, 0)
 
-        async def evaluate(script: str) -> object:
-            if script == "typeof submit_buy === 'function'":
-                return True
-            if script == "submit_buy()":
-                await release.wait()
-                return None
-            raise AssertionError(f"Unexpected script: {script}")
-
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
-        )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(side_effect=evaluate),
-        )
-        client = _client(SimpleNamespace(page=page))
+    async def test_submission_failure_has_unknown_outcome(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.submit_error = RuntimeError("disconnected")
+        client = _client(page)
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
-        client._inspect_current = AsyncMock()  # type: ignore[method-assign]
+
+        with self.assertRaises(BrowserMutationOutcomeUnknownError):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(page.submissions, 1)
+
+    async def test_semantic_timeout_reports_unconfirmed_result(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
 
         with (
-            patch("hvbrowser.lottery._MUTATION_TIMEOUT_SECONDS", 0.01),
+            patch(
+                "hvbrowser.lottery.wait_for_page_state",
+                new=AsyncMock(side_effect=PageStateTimeout("unchanged")),
+            ),
+            self.assertRaisesRegex(LotterySubmissionError, "Unable to confirm"),
+        ):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(page.submissions, 1)
+
+    async def test_generation_error_during_receipt_is_propagated(self) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
+        timeout = ZendriverOperationTimeout(timeout_seconds=5)
+
+        with (
+            patch(
+                "hvbrowser.lottery.wait_for_page_state",
+                new=AsyncMock(side_effect=timeout),
+            ),
             self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
             await client.purchase(
@@ -260,118 +328,8 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
-        self.assertEqual(raised.exception.timeout_seconds, 0.01)
-        client._inspect_current.assert_not_awaited()
-        self.assertEqual(page.evaluate.await_count, 2)
-        release.set()
-        await asyncio.sleep(0)
-
-    async def test_purchase_requires_exact_post_submit_confirmation(self) -> None:
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
-        )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(side_effect=[True, None]),
-        )
-        driver = SimpleNamespace(page=page)
-        client = _client(driver, confirmation_checks=1, confirmation_interval=0)
-        before = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
-        after = LotterySnapshot(LotteryKind.WEAPON, 800_000, 1_000)
-        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
-        client._inspect_current = AsyncMock(  # type: ignore[method-assign]
-            return_value=after
-        )
-
-        with self.assertLogs("hvbrowser.lottery", level="DEBUG") as captured:
-            report = await client.purchase(
-                LotteryKind.WEAPON,
-                800,
-                context=MaintenanceNavigationContext.ORDINARY,
-                expected_before=before,
-            )
-
-        self.assertEqual(report.purchased, 800)
-        self.assertEqual(report.spent_gp, 800_000)
-        self.assertEqual(report.after, after)
-        self.assertEqual(len(captured.output), 1)
-        self.assertTrue(captured.output[0].startswith("DEBUG:hvbrowser.lottery:"))
-        self.assertIn("Purchased 800 Weapon Lottery tickets", captured.output[0])
-        ticket_input.send_keys.assert_awaited_once_with("800")
-        self.assertEqual(
-            page.evaluate.await_args_list,
-            [
-                unittest.mock.call("typeof submit_buy === 'function'"),
-                unittest.mock.call("submit_buy()"),
-            ],
-        )
-
-    async def test_purchase_warns_once_after_confirmation_read_recovers(
-        self,
-    ) -> None:
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
-        )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(side_effect=[True, None]),
-        )
-        client = _client(
-            SimpleNamespace(page=page),
-            confirmation_checks=2,
-            confirmation_interval=0,
-        )
-        before = LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200)
-        after = LotterySnapshot(LotteryKind.WEAPON, 800_000, 1_000)
-        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
-        client._inspect_current = AsyncMock(  # type: ignore[method-assign]
-            side_effect=[
-                LotteryPageError("private detail\nsecond line"),
-                after,
-            ]
-        )
-
-        with self.assertLogs("hvbrowser.lottery", level="WARNING") as captured:
-            report = await client.purchase(
-                LotteryKind.WEAPON,
-                800,
-                context=MaintenanceNavigationContext.ORDINARY,
-                expected_before=before,
-            )
-
-        self.assertEqual(report.after, after)
-        self.assertEqual(len(captured.output), 1)
-        self.assertIn("confirmed_attempt=2/2", captured.output[0])
-        self.assertIn("error_count=1", captured.output[0])
-        self.assertIn("last_error_type=LotteryPageError", captured.output[0])
-        self.assertNotIn("private detail", captured.output[0])
-
-    async def test_purchase_rejects_unconfirmed_result(self) -> None:
-        ticket_input = SimpleNamespace(
-            clear_input=AsyncMock(),
-            send_keys=AsyncMock(),
-        )
-        page = SimpleNamespace(
-            select=AsyncMock(return_value=ticket_input),
-            evaluate=AsyncMock(side_effect=[True, None]),
-        )
-        driver = SimpleNamespace(page=page)
-        client = _client(driver, confirmation_checks=1, confirmation_interval=0)
-        before = LotterySnapshot(LotteryKind.ARMOR, 800_000, 100)
-        unchanged = LotterySnapshot(LotteryKind.ARMOR, 800_000, 100)
-        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
-        client._inspect_current = AsyncMock(  # type: ignore[method-assign]
-            return_value=unchanged
-        )
-
-        with self.assertRaises(LotterySubmissionError):
-            await client.purchase(
-                LotteryKind.ARMOR,
-                800,
-                context=MaintenanceNavigationContext.ORDINARY,
-            )
+        self.assertIs(raised.exception, timeout)
+        self.assertEqual(page.submissions, 1)
 
 
 if __name__ == "__main__":

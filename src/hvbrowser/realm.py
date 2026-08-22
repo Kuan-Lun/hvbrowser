@@ -4,12 +4,10 @@ from enum import StrEnum
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from .runtime import setup_logger, wait_for_zendriver
+from .runtime import evaluate_page, setup_logger
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
-
-_CURRENT_URL_TIMEOUT_SECONDS = 8.0
 
 
 class Realm(StrEnum):
@@ -68,11 +66,7 @@ class RealmNavigator:
         self._driver = driver
 
     async def current(self) -> Realm:
-        url = await wait_for_zendriver(
-            self._driver.page.evaluate("window.location.href"),
-            timeout=_CURRENT_URL_TIMEOUT_SECONDS,
-            owner=self._driver.page,
-        )
+        url = await evaluate_page(self._driver.page, "window.location.href")
         return realm_from_url(url)
 
     async def go_home(self, realm: Realm, *, force: bool = False) -> None:

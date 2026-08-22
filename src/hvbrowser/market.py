@@ -1,21 +1,58 @@
 import re
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 
 from .realm import Realm, RealmNavigator
-from .runtime import ZendriverOperationTimeout, wait_for_zendriver
+from .runtime import (
+    SERVER_STATE_RECEIPT_TIMEOUT_SECONDS,
+    Deadline,
+    PageStateTimeout,
+    evaluate_page,
+    invoke_mutation,
+    is_browser_generation_error,
+    query_page,
+    wait_for_page_state,
+)
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 MARKET_ROOT_URL = f"{HENTAIVERSE_ROOT_URL}/"
 ISEKAI_MARKET_ROOT_URL = HENTAIVERSE_ISEKAI_ROOT_URL
 
-_READ_TIMEOUT_SECONDS = 8.0
-_MUTATION_TIMEOUT_SECONDS = 15.0
-_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
-_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
-_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS = 1.0
-_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS = 3.0
+_MARKET_CATEGORY_STATE_SCRIPT = r"""
+(() => {
+    const root = document.getElementById("market_itemlist");
+    return {
+        hasItemList: Boolean(root),
+        rows: root ? Array.from(
+            root.querySelectorAll("table > tbody > tr[onclick]")
+        ).map((row) => ({
+            onclick: row.getAttribute("onclick") || "",
+            cells: Array.from(row.querySelectorAll("td"), (cell) =>
+                cell.textContent || ""
+            ),
+        })) : [],
+    };
+})()
+"""
+_MARKET_SALE_STATE_SCRIPT = r"""
+(() => {
+    const stock = document.querySelector("#sell_order_stock_field > span");
+    const error = document.querySelector("#messagebox_inner p.messagebox_error");
+    return {
+        sellOrders: Array.from(document.querySelectorAll(
+            '#market_itemsell td[onclick*="autofill_from_sell_order"]'
+        ), (cell) => ({
+            onclick: cell.getAttribute("onclick") || "",
+            text: cell.textContent || "",
+        })),
+        hasStockControl: Boolean(stock),
+        stockText: stock ? stock.textContent : null,
+        hasUpdateButton: Boolean(document.getElementById("sellorder_update")),
+        errorText: error ? error.textContent : null,
+    };
+})()
+"""
 
 
 class MarketCategory(StrEnum):
@@ -146,6 +183,83 @@ class _SaleForm:
     update_button: Any
 
 
+@dataclass(frozen=True, slots=True)
+class _MarketCategoryRow:
+    onclick: str
+    cells: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _MarketSaleState:
+    sell_orders: tuple[tuple[str, str], ...]
+    has_stock_control: bool
+    stock_text: str | None
+    has_update_button: bool
+    error_text: str | None
+
+
+def _decode_market_category(raw: object) -> tuple[_MarketCategoryRow, ...]:
+    if not isinstance(raw, dict):
+        raise MarketPageError("Market category state is invalid")
+    payload = cast(dict[object, object], raw)
+    if payload.get("hasItemList") is not True:
+        raise MarketPageError("Market item list is missing")
+    rows = payload.get("rows")
+    if not isinstance(rows, list):
+        raise MarketPageError("Market item rows are invalid")
+    decoded: list[_MarketCategoryRow] = []
+    for raw_row in rows:
+        if not isinstance(raw_row, dict):
+            raise MarketPageError("Market item row is invalid")
+        row = cast(dict[object, object], raw_row)
+        onclick = row.get("onclick")
+        cells = row.get("cells")
+        if (
+            not isinstance(onclick, str)
+            or not isinstance(cells, list)
+            or not all(isinstance(cell, str) for cell in cells)
+        ):
+            raise MarketPageError("Market item row is invalid")
+        decoded.append(_MarketCategoryRow(onclick, tuple(cells)))
+    return tuple(decoded)
+
+
+def _decode_market_sale_state(raw: object) -> _MarketSaleState:
+    if not isinstance(raw, dict):
+        raise MarketPageError("Market sale state is invalid")
+    payload = cast(dict[object, object], raw)
+    raw_orders = payload.get("sellOrders")
+    has_stock_control = payload.get("hasStockControl")
+    stock_text = payload.get("stockText")
+    has_update_button = payload.get("hasUpdateButton")
+    error_text = payload.get("errorText")
+    if (
+        not isinstance(raw_orders, list)
+        or type(has_stock_control) is not bool
+        or (stock_text is not None and not isinstance(stock_text, str))
+        or type(has_update_button) is not bool
+        or (error_text is not None and not isinstance(error_text, str))
+    ):
+        raise MarketPageError("Market sale state is invalid")
+    orders: list[tuple[str, str]] = []
+    for raw_order in raw_orders:
+        if not isinstance(raw_order, dict):
+            raise MarketPageError("Market sell order is invalid")
+        order = cast(dict[object, object], raw_order)
+        onclick = order.get("onclick")
+        text = order.get("text")
+        if not isinstance(onclick, str) or not isinstance(text, str):
+            raise MarketPageError("Market sell order is invalid")
+        orders.append((onclick, text))
+    return _MarketSaleState(
+        tuple(orders),
+        has_stock_control,
+        stock_text,
+        has_update_button,
+        error_text,
+    )
+
+
 def market_browse_url(category: MarketCategory, *, realm: Realm) -> str:
     if not isinstance(realm, Realm):
         raise TypeError("realm must be a Realm")
@@ -248,12 +362,13 @@ class MarketClient:
         self, item: MarketItem, *, realm: Realm
     ) -> MarketSaleQuote:
         """Inspect the current sell-side pricing source without clicking it."""
-        sale_form = await self._open_sale_form(item, realm=realm)
+        state = await self._open_sale_state(item, realm=realm)
+        sell_order_id, order_text, current_stock = self._sale_details(item, state)
         return MarketSaleQuote(
             item=item,
-            sell_order_id=sale_form.sell_order_id,
-            order_text=sale_form.order_text,
-            current_stock=sale_form.current_stock,
+            sell_order_id=sell_order_id,
+            order_text=order_text,
+            current_stock=current_stock,
         )
 
     async def submit_sales(self, plan: MarketSalePlan) -> MarketSaleReport:
@@ -280,31 +395,53 @@ class MarketClient:
                     f"Market sale plan is stale for {item.name!r}: "
                     f"planned={item.stock}, current={sale_form.current_stock}"
                 )
-            await wait_for_zendriver(
-                self._driver.page.evaluate(
-                    f"autofill_from_sell_order({sale_form.sell_order_id},0,0);"
-                ),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=self._driver.page,
-            )
-            await wait_for_zendriver(
-                sale_form.stock_control.click(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=sale_form.stock_control,
-            )
-            await wait_for_zendriver(
-                sale_form.update_button.click(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
-                owner=sale_form.update_button,
-            )
-            await wait_for_zendriver(
-                self._driver.page.wait(1),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self._driver.page,
-            )
-            await self._raise_for_submission_error(item)
-
-            remaining_stock = await self._read_item_stock(item, realm=plan.realm)
+            deadline = Deadline.after(SERVER_STATE_RECEIPT_TIMEOUT_SECONDS)
+            try:
+                await invoke_mutation(
+                    lambda: self._driver.page.evaluate(
+                        "autofill_from_sell_order(" f"{sale_form.sell_order_id},0,0);"
+                    ),
+                    owner=self._driver.page,
+                    operation=f"Market autofill for {item.name}",
+                    deadline=deadline,
+                )
+                await invoke_mutation(
+                    sale_form.stock_control.click,
+                    owner=sale_form.stock_control,
+                    operation=f"Market stock selection for {item.name}",
+                    deadline=deadline,
+                )
+                await invoke_mutation(
+                    sale_form.update_button.click,
+                    owner=sale_form.update_button,
+                    operation=f"Market sale submission for {item.name}",
+                    deadline=deadline,
+                )
+            except Exception as error:
+                if is_browser_generation_error(error):
+                    raise
+                raise MarketSubmissionError(
+                    f"Market sale outcome is unknown for {item.name!r}"
+                ) from error
+            try:
+                state = await wait_for_page_state(
+                    self._driver.page,
+                    snapshot_expression=_MARKET_SALE_STATE_SCRIPT,
+                    decode=_decode_market_sale_state,
+                    accept=lambda current: current.error_text is not None
+                    or self._sale_state_stock_is_zero(current),
+                    deadline=deadline,
+                    description=f"Market sale result for {item.name}",
+                )
+            except (PageStateTimeout, MarketPageError) as error:
+                raise MarketSubmissionError(
+                    f"Unable to confirm Market sale for {item.name!r}"
+                ) from error
+            if state.error_text is not None:
+                message = state.error_text.strip() or "unknown Market error"
+                raise MarketSubmissionError(f"Market rejected {item.name!r}: {message}")
+            assert state.stock_text is not None
+            remaining_stock = parse_market_stock(state.stock_text)
             if remaining_stock != 0:
                 raise MarketSubmissionError(
                     f"Market did not sell all planned stock for {item.name!r}: "
@@ -314,147 +451,121 @@ class MarketClient:
         return MarketSaleReport(realm=plan.realm, sales=tuple(sales))
 
     async def _open_sale_form(self, item: MarketItem, *, realm: Realm) -> _SaleForm:
-        await self._driver.get(
-            market_item_url(item.category, item.item_id, realm=realm)
-        )
+        state = await self._open_sale_state(item, realm=realm)
+        sell_order_id, order_text, current_stock = self._sale_details(item, state)
         try:
-            sell_order_cells = await wait_for_zendriver(
-                self._driver.page.xpath(
-                    "//*[@id='market_itemsell']"
-                    "//td[contains(@onclick, 'autofill_from_sell_order')]",
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
+            stock_control = await query_page(
+                self._driver.page,
+                "#sell_order_stock_field > span",
             )
-            stock_control = await wait_for_zendriver(
-                self._driver.page.select(
-                    "#sell_order_stock_field > span",
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
+            update_button = await query_page(
+                self._driver.page,
+                "#sellorder_update",
             )
-            update_button = await wait_for_zendriver(
-                self._driver.page.select(
-                    "#sellorder_update",
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
-            )
-        except ZendriverOperationTimeout:
-            raise
-        except TimeoutError as error:
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
             raise MarketPageError(
                 f"Market sale form is missing for {item.name!r}"
             ) from error
-        if not sell_order_cells:
-            raise MarketPageError(
-                f"Market has no existing sell order to price {item.name!r}"
-            )
-        onclick = str(sell_order_cells[0].attrs.get("onclick", ""))
+        if stock_control is None or update_button is None:
+            raise MarketPageError(f"Market sale form is missing for {item.name!r}")
         return _SaleForm(
-            sell_order_id=parse_market_sell_order_id(onclick),
-            order_text=sell_order_cells[0].text.strip(),
-            current_stock=parse_market_stock(stock_control.text),
+            sell_order_id=sell_order_id,
+            order_text=order_text,
+            current_stock=current_stock,
             stock_control=stock_control,
             update_button=update_button,
         )
 
-    async def _read_item_stock(self, item: MarketItem, *, realm: Realm) -> int:
+    async def _open_sale_state(
+        self,
+        item: MarketItem,
+        *,
+        realm: Realm,
+    ) -> _MarketSaleState:
         await self._driver.get(
             market_item_url(item.category, item.item_id, realm=realm)
         )
         try:
-            stock_control = await wait_for_zendriver(
-                self._driver.page.select(
-                    "#sell_order_stock_field > span",
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
+            state = _decode_market_sale_state(
+                await evaluate_page(
+                    self._driver.page,
+                    _MARKET_SALE_STATE_SCRIPT,
+                )
             )
-        except ZendriverOperationTimeout:
-            raise
-        except TimeoutError as error:
-            raise MarketSubmissionError(
-                f"Market stock confirmation is missing for {item.name!r}"
+        except Exception as error:
+            if is_browser_generation_error(error):
+                raise
+            raise MarketPageError(
+                f"Market sale form is missing for {item.name!r}"
             ) from error
-        stock_text = stock_control.text
-        if not stock_text.strip():
-            raise MarketSubmissionError(
-                f"Market stock confirmation is blank for {item.name!r}"
-            )
-        try:
-            return parse_market_stock(stock_text)
-        except MarketPageError as error:
-            raise MarketSubmissionError(
-                f"Market stock confirmation is invalid for {item.name!r}"
-            ) from error
+        return state
 
-    async def _raise_for_submission_error(self, item: MarketItem) -> None:
-        try:
-            error_message = await wait_for_zendriver(
-                self._driver.page.select(
-                    "#messagebox_inner p.messagebox_error",
-                    timeout=_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
+    @staticmethod
+    def _sale_details(
+        item: MarketItem,
+        state: _MarketSaleState,
+    ) -> tuple[int, str, int]:
+        if not state.sell_orders:
+            raise MarketPageError(
+                f"Market has no existing sell order to price {item.name!r}"
             )
-        except ZendriverOperationTimeout:
-            raise
-        except TimeoutError:
-            return
-        message = error_message.text.strip() or "unknown Market error"
-        raise MarketSubmissionError(f"Market rejected {item.name!r}: {message}")
+        if (
+            not state.has_stock_control
+            or state.stock_text is None
+            or not state.stock_text.strip()
+            or not state.has_update_button
+        ):
+            raise MarketPageError(f"Market sale form is missing for {item.name!r}")
+        onclick, order_text = state.sell_orders[0]
+        return (
+            parse_market_sell_order_id(onclick),
+            order_text.strip(),
+            parse_market_stock(state.stock_text),
+        )
+
+    @staticmethod
+    def _sale_state_stock_is_zero(state: _MarketSaleState) -> bool:
+        if state.stock_text is None or not state.stock_text.strip():
+            return False
+        try:
+            return parse_market_stock(state.stock_text) == 0
+        except MarketPageError:
+            return False
 
     async def _inspect_category(
         self, category: MarketCategory, *, realm: Realm
     ) -> list[MarketItem]:
         await self._driver.get(market_browse_url(category, realm=realm))
         try:
-            item_list = await wait_for_zendriver(
-                self._driver.page.select(
-                    "#market_itemlist",
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self._driver.page,
+            rows = _decode_market_category(
+                await evaluate_page(
+                    self._driver.page,
+                    _MARKET_CATEGORY_STATE_SCRIPT,
+                )
             )
-        except ZendriverOperationTimeout:
-            raise
-        except TimeoutError as error:
+        except Exception as error:
+            if is_browser_generation_error(error) or isinstance(error, MarketPageError):
+                raise
             raise MarketPageError(
-                f"Market item list is missing for {market_category_label(category)}"
+                f"Unable to inspect {market_category_label(category)} Market items"
             ) from error
 
-        rows = await wait_for_zendriver(
-            item_list.query_selector_all("table > tbody > tr[onclick]"),
-            timeout=_READ_TIMEOUT_SECONDS,
-            owner=item_list,
-        )
         items: list[MarketItem] = []
         for row in rows:
-            cells = await wait_for_zendriver(
-                row.query_selector_all("td"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=row,
-            )
-            if len(cells) < 2:
+            if len(row.cells) < 2:
                 raise MarketPageError(
                     f"Market row has fewer than two cells in "
                     f"{market_category_label(category)}"
                 )
-            name = cells[0].text.strip()
-            onclick = str(row.attrs.get("onclick", ""))
+            name = row.cells[0].strip()
             items.append(
                 MarketItem(
                     category=category,
-                    item_id=parse_market_item_id(onclick),
+                    item_id=parse_market_item_id(row.onclick),
                     name=name,
-                    stock=parse_market_stock(cells[1].text),
+                    stock=parse_market_stock(row.cells[1]),
                 )
             )
         return items

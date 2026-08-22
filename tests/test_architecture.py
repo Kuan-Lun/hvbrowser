@@ -103,6 +103,32 @@ def _number(node: ast.expr | None, constants: dict[str, float]) -> float | None:
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_server_mutations_use_a_receipt_budget_separate_from_command_cap(
+        self,
+    ) -> None:
+        source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
+        for filename in (
+            "equipment_repair.py",
+            "lottery.py",
+            "market.py",
+            "monster_lab.py",
+            "player.py",
+        ):
+            source = (source_root / filename).read_text()
+            self.assertIn("SERVER_STATE_RECEIPT_TIMEOUT_SECONDS", source, filename)
+
+        runtime_constants = _constant_numbers(
+            ast.parse((source_root / "runtime.py").read_text())
+        )
+        self.assertLessEqual(
+            runtime_constants["PROTOCOL_COMMAND_TIMEOUT_SECONDS"],
+            5,
+        )
+        self.assertGreater(
+            runtime_constants["SERVER_STATE_RECEIPT_TIMEOUT_SECONDS"],
+            6,
+        )
+
     def test_hvbrowser_does_not_import_hvbattle(self) -> None:
         source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
         imported_modules: set[str] = set()
@@ -277,6 +303,7 @@ class ArchitectureTests(unittest.TestCase):
     def test_production_zendriver_calls_use_strict_owned_watchdogs(self) -> None:
         source_root = Path(__file__).parents[1] / "src" / "hvbrowser"
         violations: list[str] = []
+        protocol_cap = 5.0
 
         for source_file in source_root.glob("*.py"):
             tree = ast.parse(source_file.read_text(), filename=str(source_file))
@@ -287,11 +314,28 @@ class ArchitectureTests(unittest.TestCase):
             }
             constants = _constant_numbers(tree)
 
+            for name, value in constants.items():
+                if (
+                    "TIMEOUT" in name
+                    and name
+                    not in {
+                        "_ACCOUNT_CLOSE_TIMEOUT_SECONDS",
+                        "SERVER_STATE_RECEIPT_TIMEOUT_SECONDS",
+                    }
+                    and value > protocol_cap
+                ):
+                    violations.append(
+                        f"{source_file.name}: {name} exceeds the protocol cap"
+                    )
+
             for node in ast.walk(tree):
                 if not isinstance(node, ast.Call):
                     continue
 
-                if _call_name(node) == "wait_for_zendriver":
+                if _call_name(node) in {
+                    "wait_for_zendriver",
+                    "wait_for_zendriver_mutation",
+                }:
                     owner = _keyword(node, "owner")
                     timeout = _keyword(node, "timeout")
                     if not isinstance(parents.get(node), ast.Await):
@@ -310,13 +354,15 @@ class ArchitectureTests(unittest.TestCase):
                         violations.append(
                             f"{source_file.name}:{node.lineno}: watchdog timeout is missing"
                         )
-                    elif (resolved_timeout := _number(timeout, constants)) is None or (
-                        resolved_timeout <= 0
-                    ):
-                        violations.append(
-                            f"{source_file.name}:{node.lineno}: watchdog timeout must "
-                            "be an explicit positive budget"
-                        )
+                    else:
+                        resolved_timeout = _number(timeout, constants)
+                        if resolved_timeout is not None and not (
+                            0 < resolved_timeout <= protocol_cap
+                        ):
+                            violations.append(
+                                f"{source_file.name}:{node.lineno}: watchdog timeout "
+                                "exceeds the five-second command cap"
+                            )
                     if not node.args:
                         violations.append(
                             f"{source_file.name}:{node.lineno}: watchdog awaitable is missing"
@@ -336,70 +382,55 @@ class ArchitectureTests(unittest.TestCase):
                             "the exact protocol receiver"
                         )
 
-                    if (
-                        isinstance(operation, ast.Call)
-                        and isinstance(operation.func, ast.Attribute)
-                        and operation.func.attr in {"select", "xpath"}
-                    ):
-                        inner = _number(_keyword(operation, "timeout"), constants)
-                        outer = _number(timeout, constants)
-                        if inner is None or outer is None or outer - inner < 2:
-                            violations.append(
-                                f"{source_file.name}:{node.lineno}: selector watchdog "
-                                "must leave at least two seconds of outer margin"
-                            )
                     continue
 
                 if _is_zendriver_protocol_call(node):
-                    parent = parents.get(node)
-                    safely_wrapped = (
-                        isinstance(parent, ast.Call)
-                        and _call_name(parent) == "wait_for_zendriver"
-                        and bool(parent.args)
-                        and parent.args[0] is node
-                    )
+                    ancestor = parents.get(node)
+                    safely_wrapped = False
+                    while ancestor is not None:
+                        if isinstance(ancestor, ast.Call) and _call_name(ancestor) in {
+                            "wait_for_zendriver",
+                            "wait_for_zendriver_mutation",
+                            "evaluate_page",
+                            "query_page",
+                            "invoke_mutation",
+                        }:
+                            safely_wrapped = True
+                            break
+                        if isinstance(
+                            ancestor,
+                            ast.FunctionDef | ast.AsyncFunctionDef,
+                        ):
+                            break
+                        ancestor = parents.get(ancestor)
                     if not safely_wrapped:
                         violations.append(
                             f"{source_file.name}:{node.lineno}: raw Zendriver "
                             f"{node.func.attr} call"
                         )
 
-                if (
-                    isinstance(node.func, ast.Attribute)
-                    and node.func.attr == "wait"
-                    and _is_driver_receiver(node.func.value)
+                if isinstance(node.func, ast.Attribute) and (
+                    node.func.attr in {"select", "xpath"}
+                    or node.func.attr == "wait"
+                    and _attribute_parts(node.func.value)[-1:]
+                    in {("page",), ("driver",), ("_driver",)}
                 ):
-                    if not isinstance(parents.get(node), ast.Await):
-                        violations.append(
-                            f"{source_file.name}:{node.lineno}: Driver.wait is not awaited"
-                        )
-                    owner = _keyword(node, "owner")
-                    operation_timeout = _keyword(node, "operation_timeout")
-                    action = node.args[0] if node.args else None
-                    action_owner = (
-                        action.value if isinstance(action, ast.Attribute) else None
+                    violations.append(
+                        f"{source_file.name}:{node.lineno}: polling/fixed wait "
+                        f"{node.func.attr} is forbidden"
                     )
-                    if owner is None or operation_timeout is None:
+
+                if _call_name(node) == "sleep" and node.args:
+                    duration = _number(node.args[0], constants)
+                    if duration is not None and duration > 0:
                         violations.append(
-                            f"{source_file.name}:{node.lineno}: Driver.wait requires "
-                            "owner and operation_timeout"
+                            f"{source_file.name}:{node.lineno}: fixed readiness sleep"
                         )
-                    elif (
-                        resolved_operation_timeout := _number(
-                            operation_timeout, constants
-                        )
-                    ) is None or resolved_operation_timeout <= 0:
-                        violations.append(
-                            f"{source_file.name}:{node.lineno}: Driver.wait operation "
-                            "timeout must be an explicit positive budget"
-                        )
-                    elif action_owner is not None and ast.dump(
-                        action_owner
-                    ) != ast.dump(owner):
-                        violations.append(
-                            f"{source_file.name}:{node.lineno}: Driver.wait owner is not "
-                            "the exact action receiver"
-                        )
+
+                if _keyword(node, "await_promise") is not None:
+                    violations.append(
+                        f"{source_file.name}:{node.lineno}: page-side promise wait"
+                    )
 
         self.assertEqual(violations, [])
 

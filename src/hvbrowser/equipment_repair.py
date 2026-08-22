@@ -1,9 +1,8 @@
 """Typed inspection and repair operations for equipped gear."""
 
-import logging
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
@@ -13,30 +12,21 @@ from .maintenance_navigation import (
 )
 from .realm import Realm, RealmNavigator
 from .runtime import (
+    LOCAL_DOM_STATE_TIMEOUT_SECONDS,
+    SERVER_STATE_RECEIPT_TIMEOUT_SECONDS,
+    Deadline,
+    PageStateTimeout,
+    evaluate_page,
+    invoke_mutation,
     is_browser_generation_error,
+    query_page,
     setup_logger,
-    wait_for_zendriver,
+    wait_for_page_state,
 )
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
 
-_READ_TIMEOUT_SECONDS = 8.0
-_MUTATION_TIMEOUT_SECONDS = 15.0
-_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
-_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
-
-_EQUIPMENT_COUNT_XPATH = "//*[@id='equipform']//label[@id='equipcount']"
-_REPAIR_SUBMIT_XPATH = "//*[@id='equipform']//input[@id='equipsubmit']"
-_REPAIR_SELECTED_PAGE_XPATH = (
-    "//*[@id='armory_outer']["
-    ".//*[@id='armory_left']/a[contains(@href, 'screen=repair')]"
-    "/*[contains(concat(' ', normalize-space(@class), ' '), ' armory_tab ') "
-    "and contains(concat(' ', normalize-space(@class), ' '), ' armory_cur ')] "
-    "and .//*[@id='filterbar']/a[contains(@href, 'filter=equipped')]"
-    "/*[contains(concat(' ', normalize-space(@class), ' '), ' cfbs ')]"
-    "]"
-)
 _EQUIPMENT_STATE_SCRIPT = """
 (() => {
     const equipForm = document.getElementById("equipform");
@@ -46,10 +36,28 @@ _EQUIPMENT_STATE_SCRIPT = """
         || !Number.isInteger(selectable_count)
         || selectable_count < 0
     ) ? null : selectable_count;
+    const selectedCount = (
+        typeof selected_count !== "number"
+        || !Number.isInteger(selected_count)
+        || selected_count < 0
+    ) ? null : selected_count;
+    const submit = document.getElementById("equipsubmit");
+    const error = document.querySelector("p.messagebox_error");
     return {
+        repairSelected: Boolean(document.querySelector(
+            '#armory_left a[href*="screen=repair"] .armory_tab.armory_cur'
+        )),
+        equippedSelected: Boolean(document.querySelector(
+            '#filterbar a[href*="filter=equipped"] .cfbs'
+        )),
         hasEquipForm: Boolean(equipForm),
         hasEquipList: Boolean(equipList),
+        hasEquipCount: Boolean(document.getElementById("equipcount")),
+        hasSubmit: Boolean(submit),
+        submitDisabled: submit ? Boolean(submit.disabled) : null,
         selectableCount,
+        selectedCount,
+        errorText: error ? error.textContent : null,
         empty: Boolean(
             equipList
             && (
@@ -126,15 +134,74 @@ class _EquipmentRepairDriver(Protocol):
 
     async def get(self, url: str) -> None: ...
 
-    async def wait(
-        self,
-        fun: Any,
-        ischangeurl: bool,
-        sleeptime: int = 1,
-        *,
-        owner: Any,
-        operation_timeout: float,
-    ) -> None: ...
+
+@dataclass(frozen=True, slots=True)
+class _EquipmentPageState:
+    repair_selected: bool
+    equipped_selected: bool
+    has_equip_form: bool
+    has_equip_list: bool
+    has_equip_count: bool
+    has_submit: bool
+    submit_disabled: bool | None
+    selectable_count: int | None
+    selected_count: int | None
+    empty: bool
+    row_count: int | None
+    error_text: str | None
+
+
+def _decode_equipment_state(raw: object) -> _EquipmentPageState:
+    if not isinstance(raw, dict):
+        raise EquipmentRepairPageError("Equipment repair state is invalid")
+    payload = cast(dict[object, object], raw)
+    repair_selected = payload.get("repairSelected")
+    equipped_selected = payload.get("equippedSelected")
+    has_equip_form = payload.get("hasEquipForm")
+    has_equip_list = payload.get("hasEquipList")
+    has_equip_count = payload.get("hasEquipCount")
+    has_submit = payload.get("hasSubmit")
+    submit_disabled = payload.get("submitDisabled")
+    selectable_count = payload.get("selectableCount")
+    selected_count = payload.get("selectedCount")
+    empty = payload.get("empty")
+    row_count = payload.get("rowCount")
+    error_text = payload.get("errorText")
+    if (
+        type(repair_selected) is not bool
+        or type(equipped_selected) is not bool
+        or type(has_equip_form) is not bool
+        or type(has_equip_list) is not bool
+        or type(has_equip_count) is not bool
+        or type(has_submit) is not bool
+        or (submit_disabled is not None and type(submit_disabled) is not bool)
+        or (
+            selectable_count is not None
+            and (type(selectable_count) is not int or selectable_count < 0)
+        )
+        or (
+            selected_count is not None
+            and (type(selected_count) is not int or selected_count < 0)
+        )
+        or type(empty) is not bool
+        or (row_count is not None and (type(row_count) is not int or row_count < 0))
+        or (error_text is not None and not isinstance(error_text, str))
+    ):
+        raise EquipmentRepairPageError("Equipment repair state is invalid")
+    return _EquipmentPageState(
+        repair_selected,
+        equipped_selected,
+        has_equip_form,
+        has_equip_list,
+        has_equip_count,
+        has_submit,
+        submit_disabled,
+        selectable_count,
+        selected_count,
+        empty,
+        row_count,
+        error_text,
+    )
 
 
 class EquipmentRepairClient:
@@ -155,8 +222,8 @@ class EquipmentRepairClient:
     async def inspect(self) -> EquipmentRepairSnapshot:
         """Navigate to Repair and return a read-only realm-scoped snapshot."""
         realm = await self.realm.current()
-        await self._navigate(realm)
-        snapshot, _ = await self._inspect_current(realm)
+        state = await self._navigate(realm)
+        snapshot, _ = await self._inspect_current(realm, state=state)
         return snapshot
 
     async def repair_all(
@@ -172,8 +239,8 @@ class EquipmentRepairClient:
             )
 
         realm = await self.realm.current()
-        await self._navigate(realm)
-        before, equipcount = await self._inspect_current(realm)
+        state = await self._navigate(realm)
+        before, equipcount = await self._inspect_current(realm, state=state)
         if expected_before is not None and before != expected_before:
             raise EquipmentRepairStateChangedError(
                 "Equipment repair state changed; inspect and decide again"
@@ -189,11 +256,18 @@ class EquipmentRepairClient:
                 "Equipment count control is missing for non-zero repair state"
             )
 
-        is_disabled, submit = await self._select_all_and_inspect_submit(equipcount)
+        selection_deadline = Deadline.after(LOCAL_DOM_STATE_TIMEOUT_SECONDS)
+        is_disabled, submit = await self._select_all_and_inspect_submit(
+            equipcount,
+            deadline=selection_deadline,
+        )
         if is_disabled:
             logger.debug("Re-entering Repair tab to verify fresh server state")
-            await self._navigate(realm)
-            fresh, fresh_equipcount = await self._inspect_current(realm)
+            fresh_state = await self._navigate(realm)
+            fresh, fresh_equipcount = await self._inspect_current(
+                realm,
+                state=fresh_state,
+            )
             if fresh != before:
                 raise EquipmentRepairStateChangedError(
                     "Equipment repair state changed during fresh-state verification"
@@ -203,8 +277,10 @@ class EquipmentRepairClient:
                     "Equipment count control is missing during fresh-state verification"
                 )
 
+            selection_deadline = Deadline.after(LOCAL_DOM_STATE_TIMEOUT_SECONDS)
             is_disabled, submit = await self._select_all_and_inspect_submit(
-                fresh_equipcount
+                fresh_equipcount,
+                deadline=selection_deadline,
             )
             if is_disabled:
                 logger.info(
@@ -221,16 +297,13 @@ class EquipmentRepairClient:
                 "the first disabled observation was stale"
             )
 
+        submission_deadline = Deadline.after(SERVER_STATE_RECEIPT_TIMEOUT_SECONDS)
         try:
-            await wait_for_zendriver(
-                submit.mouse_click(),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
+            await invoke_mutation(
+                submit.mouse_click,
                 owner=submit,
-            )
-            await wait_for_zendriver(
-                self.page.wait(2),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
+                operation="Equipment repair submission",
+                deadline=submission_deadline,
             )
         except Exception as error:
             if is_browser_generation_error(error):
@@ -240,11 +313,29 @@ class EquipmentRepairClient:
             ) from error
 
         try:
-            after, _equipcount_after = await self._inspect_current(realm)
-        except EquipmentRepairPageError as error:
+            after_state = await wait_for_page_state(
+                self.page,
+                snapshot_expression=_EQUIPMENT_STATE_SCRIPT,
+                decode=_decode_equipment_state,
+                accept=lambda current: current.error_text is not None
+                or self._repair_count(current) == 0,
+                deadline=submission_deadline,
+                description="equipment repair completion",
+            )
+            after, _equipcount_after = await self._inspect_current(
+                realm,
+                state=after_state,
+                deadline=submission_deadline,
+            )
+        except (PageStateTimeout, EquipmentRepairPageError) as error:
             raise EquipmentRepairSubmissionError(
                 "Unable to confirm equipment repair"
             ) from error
+        if after_state.error_text is not None:
+            message = after_state.error_text.strip() or "repair rejected"
+            raise EquipmentRepairSubmissionError(
+                f"Equipment repair was rejected: {message}"
+            )
         if after.repair_count != 0:
             raise EquipmentRepairSubmissionError(
                 "Unable to confirm equipment repair: "
@@ -258,10 +349,10 @@ class EquipmentRepairClient:
             after,
         )
 
-    async def _navigate(self, realm: Realm) -> None:
-        await self._open_repair_directly(realm)
+    async def _navigate(self, realm: Realm) -> _EquipmentPageState:
+        return await self._open_repair_directly(realm)
 
-    async def _open_repair_directly(self, realm: Realm) -> None:
+    async def _open_repair_directly(self, realm: Realm) -> _EquipmentPageState:
         await self._ensure_navigation_is_safe(
             realm,
             "before direct Armory navigation",
@@ -284,7 +375,7 @@ class EquipmentRepairClient:
                 "Unable to open The Armory through its direct URL"
             ) from error
 
-        await self._verify_repair_destination(realm)
+        return await self._verify_repair_destination(realm)
 
     async def _ensure_navigation_is_safe(
         self,
@@ -313,7 +404,12 @@ class EquipmentRepairClient:
             raise MaintenanceNavigationBlockedError(observation.blocker)
         return observation
 
-    async def _verify_repair_destination(self, realm: Realm) -> None:
+    async def _verify_repair_destination(
+        self,
+        realm: Realm,
+        *,
+        deadline: Deadline | None = None,
+    ) -> _EquipmentPageState:
         observation = await self._ensure_navigation_is_safe(
             realm,
             "after opening Repair",
@@ -334,98 +430,94 @@ class EquipmentRepairClient:
             raise EquipmentRepairPageError(
                 "Repair navigation did not land on the Equipped filter"
             )
-        await self._verify_repair_selected()
-
-    async def _verify_repair_selected(self) -> None:
-        try:
-            selected_tabs = await wait_for_zendriver(
-                self.page.xpath(
-                    _REPAIR_SELECTED_PAGE_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError(
-                "Unable to verify the Armory Repair page"
-            ) from error
-        if not selected_tabs:
-            raise EquipmentRepairPageError(
-                "Armory Repair selected-tab marker or Equipped filter marker is missing"
-            )
+        state = await self._read_state(deadline=deadline)
+        return state
 
     async def _inspect_current(
         self,
         realm: Realm,
+        *,
+        state: _EquipmentPageState | None = None,
+        deadline: Deadline | None = None,
     ) -> tuple[EquipmentRepairSnapshot, Any | None]:
-        await self._verify_repair_destination(realm)
-
-        try:
-            equipcount_elements = await wait_for_zendriver(
-                self.page.xpath(
-                    _EQUIPMENT_COUNT_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
+        current = (
+            await self._verify_repair_destination(realm, deadline=deadline)
+            if state is None
+            else state
+        )
+        self._validate_repair_page_state(current)
+        repair_count = self._repair_count(current)
+        if current.has_equip_count:
+            equipcount = await query_page(
+                self.page,
+                "#equipform #equipcount",
+                deadline=deadline,
             )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError(
-                "Unable to inspect equipment repair count"
-            ) from error
-
-        try:
-            raw_state = await wait_for_zendriver(
-                self.page.evaluate(_EQUIPMENT_STATE_SCRIPT),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError(
-                "Unable to inspect equipment repair count"
-            ) from error
-        if not isinstance(raw_state, dict):
-            raise EquipmentRepairPageError("Equipment repair count state is invalid")
-        repair_count = raw_state.get("selectableCount")
-        empty = raw_state.get("empty")
-        row_count = raw_state.get("rowCount")
-        has_equip_form = raw_state.get("hasEquipForm")
-        has_equip_list = raw_state.get("hasEquipList")
-        if (
-            (repair_count is not None and type(repair_count) is not int)
-            or type(empty) is not bool
-            or (row_count is not None and (type(row_count) is not int or row_count < 0))
-            or has_equip_form is not True
-            or has_equip_list is not True
-        ):
-            raise EquipmentRepairPageError("Equipment repair count state is invalid")
-        if equipcount_elements:
-            if repair_count is None or repair_count < 0:
+            if equipcount is None:
+                raise EquipmentRepairPageError(
+                    "Equipment count control disappeared during inspection"
+                )
+            if repair_count is None:
                 raise EquipmentRepairPageError(
                     "Equipment repair count state is invalid"
                 )
-            return EquipmentRepairSnapshot(realm, repair_count), equipcount_elements[0]
-        if empty and row_count == 0 and repair_count in {None, 0}:
+            return EquipmentRepairSnapshot(realm, repair_count), equipcount
+        if current.empty and current.row_count == 0 and repair_count in {None, 0}:
             return EquipmentRepairSnapshot(realm, 0), None
         raise EquipmentRepairPageError(
             "Equipment repair count is missing without an empty equipment list"
         )
 
-    async def _select_all_and_inspect_submit(self, equipcount: Any) -> tuple[bool, Any]:
+    async def _read_state(
+        self,
+        *,
+        deadline: Deadline | None = None,
+    ) -> _EquipmentPageState:
+        try:
+            state = _decode_equipment_state(
+                await evaluate_page(
+                    self.page,
+                    _EQUIPMENT_STATE_SCRIPT,
+                    deadline=deadline,
+                )
+            )
+        except Exception as error:
+            if is_browser_generation_error(error) or isinstance(
+                error, EquipmentRepairPageError
+            ):
+                raise
+            raise EquipmentRepairPageError(
+                "Unable to inspect equipment repair state"
+            ) from error
+        self._validate_repair_page_state(state)
+        return state
+
+    @staticmethod
+    def _validate_repair_page_state(state: _EquipmentPageState) -> None:
+        if not state.has_equip_form or not state.has_equip_list:
+            raise EquipmentRepairPageError("Equipment repair form or list is missing")
+        if not state.repair_selected or not state.equipped_selected:
+            raise EquipmentRepairPageError(
+                "Armory Repair selected-tab marker or Equipped filter marker is missing"
+            )
+
+    @staticmethod
+    def _repair_count(state: _EquipmentPageState) -> int | None:
+        return state.selectable_count
+
+    async def _select_all_and_inspect_submit(
+        self,
+        equipcount: Any,
+        *,
+        deadline: Deadline,
+    ) -> tuple[bool, Any]:
         logger.debug("Before select-all click: %r", getattr(equipcount, "text", None))
         try:
-            await self.driver.wait(
+            await invoke_mutation(
                 equipcount.mouse_click,
-                ischangeurl=False,
                 owner=equipcount,
-                operation_timeout=_MUTATION_TIMEOUT_SECONDS,
+                operation="Equipment repair select-all",
+                deadline=deadline,
             )
         except Exception as error:
             if is_browser_generation_error(error):
@@ -433,80 +525,37 @@ class EquipmentRepairClient:
             raise EquipmentRepairPageError(
                 "Unable to select equipment for repair"
             ) from error
-
         try:
-            submit_elements = await wait_for_zendriver(
-                self.page.xpath(
-                    _REPAIR_SUBMIT_XPATH,
-                    timeout=_SELECTOR_INNER_TIMEOUT_SECONDS,
-                ),
-                timeout=_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                owner=self.page,
+            state = await wait_for_page_state(
+                self.page,
+                snapshot_expression=_EQUIPMENT_STATE_SCRIPT,
+                decode=_decode_equipment_state,
+                accept=lambda current: current.has_submit
+                and current.repair_selected
+                and current.equipped_selected
+                and current.has_equip_form
+                and current.has_equip_list
+                and current.submit_disabled is not None
+                and current.selectable_count is not None
+                and current.selected_count == current.selectable_count,
+                deadline=deadline,
+                description="equipment select-all state",
             )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
+        except (PageStateTimeout, EquipmentRepairPageError) as error:
             raise EquipmentRepairPageError(
-                "Unable to inspect equipment repair submission"
+                "Unable to confirm equipment selection for repair"
             ) from error
-        if not submit_elements:
-            raise EquipmentRepairPageError("Equipment repair submit button is missing")
-
-        try:
-            is_disabled = await wait_for_zendriver(
-                self.page.evaluate("document.getElementById('equipsubmit').disabled"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
+        submit = await query_page(
+            self.page,
+            "#equipform #equipsubmit",
+            deadline=deadline,
+        )
+        if submit is None:
+            raise EquipmentRepairPageError("Equipment repair submit button disappeared")
+        assert state.submit_disabled is not None
+        if state.submit_disabled:
+            logger.debug(
+                "Repair submit disabled after selecting %d items",
+                state.selected_count,
             )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise EquipmentRepairPageError(
-                "Unable to inspect equipment repair submit state"
-            ) from error
-        if type(is_disabled) is not bool:
-            raise EquipmentRepairPageError("Equipment repair submit state is invalid")
-
-        if is_disabled and logger.isEnabledFor(logging.DEBUG):
-            try:
-                debug_state = await wait_for_zendriver(
-                    self.page.evaluate("""
-                        JSON.stringify({
-                            selected_count: selected_count,
-                            selectable_count: selectable_count,
-                            block_submit: block_submit,
-                            materials: (() => {
-                                const totals = {};
-                                for (const el of document.querySelectorAll('input[name="eqids[]"]')) {
-                                    if (el.checked && eqitems[el.value]) {
-                                        for (const m in eqitems[el.value].m) {
-                                            totals[m] = (totals[m] || 0) + eqitems[el.value].m[m];
-                                        }
-                                    }
-                                }
-                                return Object.entries(totals).map(([id, need]) => ({
-                                    id,
-                                    name: itemdata[id] ? itemdata[id].n : undefined,
-                                    need,
-                                    have: itemdata[id] ? itemdata[id].c : undefined,
-                                }));
-                            })(),
-                        })
-                        """),
-                    timeout=_READ_TIMEOUT_SECONDS,
-                    owner=self.page,
-                )
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                logger.debug(
-                    "Repair submit diagnostic probe failed: error_type=%s",
-                    type(error).__name__,
-                )
-            else:
-                logger.debug(
-                    "Repair submit disabled at current observation: state=%s",
-                    debug_state,
-                )
-
-        return is_disabled, submit_elements[0]
+        return state.submit_disabled, submit

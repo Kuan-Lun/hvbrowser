@@ -1,6 +1,7 @@
 """Public HentaiVerse browser composition API."""
 
 from .account_context import (
+    AccountContextCloseTimeout,
     AccountContextError,
     AccountContextStartupStopped,
     AccountContextState,
@@ -75,6 +76,7 @@ from .session import HentaiVerseSession
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
 __all__ = [
+    "AccountContextCloseTimeout",
     "AccountContextError",
     "AccountContextState",
     "AccountContextStateError",

@@ -4,7 +4,11 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
-from hvbrowser.live_probe import _ACTIVE_BATTLE_XPATH, LiveProbeRefused, run_live_probe
+from hvbrowser.live_probe import (
+    _ACTIVE_BATTLE_SCRIPT,
+    LiveProbeRefused,
+    run_live_probe,
+)
 from hvbrowser.lottery import LotteryKind, LotterySnapshot
 from hvbrowser.maintenance_navigation import MaintenanceNavigationContext
 from hvbrowser.market import (
@@ -26,10 +30,10 @@ class _FakePage:
     def __init__(self, *, in_battle: bool = False) -> None:
         self.in_battle = in_battle
 
-    async def xpath(self, selector: str, timeout: int) -> list[object]:
-        if selector != _ACTIVE_BATTLE_XPATH or timeout != 2:
-            raise AssertionError(f"Unexpected battle check: {selector}, {timeout}")
-        return [object()] if self.in_battle else []
+    async def evaluate(self, script: str) -> bool:
+        if script != _ACTIVE_BATTLE_SCRIPT:
+            raise AssertionError(f"Unexpected battle check: {script}")
+        return self.in_battle
 
 
 class _FakeSession:

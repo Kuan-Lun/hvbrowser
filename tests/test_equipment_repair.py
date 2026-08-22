@@ -1,807 +1,464 @@
 import unittest
+from collections.abc import Callable
+from dataclasses import replace
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
-from hvbrowser import equipment_repair as repair_module
-from hvbrowser.equipment_repair import (
+from hbrowser import BrowserMutationOutcomeUnknownError
+
+from hvbrowser import (
     EquipmentRepairClient,
     EquipmentRepairOutcome,
     EquipmentRepairPageError,
     EquipmentRepairSnapshot,
     EquipmentRepairStateChangedError,
     EquipmentRepairSubmissionError,
-)
-from hvbrowser.maintenance_navigation import (
     MaintenanceNavigationBlockedError,
     MaintenanceNavigationBlocker,
-    MaintenanceNavigationObservation,
 )
+from hvbrowser.equipment_repair import _EquipmentPageState
+from hvbrowser.maintenance_navigation import MaintenanceNavigationObservation
 from hvbrowser.realm import Realm
-from hvbrowser.runtime import ZendriverOperationTimeout
-
-_PERSISTENT_REPAIR_URL = (
-    "https://hentaiverse.org/" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
-)
-_ISEKAI_REPAIR_URL = (
-    "https://hentaiverse.org/isekai/" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
-)
-_PERSISTENT_ROOT_URL = "https://hentaiverse.org/"
-_ISEKAI_ROOT_URL = "https://hentaiverse.org/isekai/"
+from hvbrowser.runtime import PageStateTimeout, ZendriverOperationTimeout
 
 
-def _observation(
-    *,
-    realm: Realm = Realm.PERSISTENT,
-    blocker: MaintenanceNavigationBlocker | None = None,
-    url: str | None = None,
-) -> MaintenanceNavigationObservation:
-    if url is None:
-        url = _ISEKAI_ROOT_URL if realm is Realm.ISEKAI else _PERSISTENT_ROOT_URL
-    return MaintenanceNavigationObservation(url, realm, blocker)
+class _Element:
+    def __init__(self, action: Callable[[], None] | None = None) -> None:
+        self._action = action
+        self.clicks = 0
+        self.text = ""
+
+    async def mouse_click(self) -> None:
+        self.clicks += 1
+        if self._action is not None:
+            self._action()
 
 
-def _element(text: str = "") -> SimpleNamespace:
-    return SimpleNamespace(
-        text=text,
-        mouse_click=AsyncMock(),
+class _Page:
+    def __init__(self, repair_count: int = 2) -> None:
+        self.repair_count = repair_count
+        self.selected_count = 0
+        self.submit_disabled = False
+        self.submit_error: Exception | None = None
+        self.server_rejection: str | None = None
+        self.error: str | None = None
+        self.keep_after_submit = False
+        self.count = _Element(self._select_all)
+        self.submit = _Element(self._submit)
+        self.expressions: list[str] = []
+
+    def _select_all(self) -> None:
+        self.selected_count = self.repair_count
+
+    def _submit(self) -> None:
+        if self.submit_error is not None:
+            raise self.submit_error
+        if self.server_rejection is not None:
+            self.error = self.server_rejection
+            return
+        if not self.keep_after_submit:
+            self.repair_count = 0
+            self.selected_count = 0
+
+    def state(self) -> _EquipmentPageState:
+        return _EquipmentPageState(
+            repair_selected=True,
+            equipped_selected=True,
+            has_equip_form=True,
+            has_equip_list=True,
+            has_equip_count=self.repair_count > 0,
+            has_submit=True,
+            submit_disabled=self.submit_disabled,
+            selectable_count=self.repair_count,
+            selected_count=self.selected_count,
+            empty=self.repair_count == 0,
+            row_count=self.repair_count,
+            error_text=self.error,
+        )
+
+    async def evaluate(self, expression: str) -> dict[str, object]:
+        self.expressions.append(expression)
+        state = self.state()
+        return {
+            "repairSelected": state.repair_selected,
+            "equippedSelected": state.equipped_selected,
+            "hasEquipForm": state.has_equip_form,
+            "hasEquipList": state.has_equip_list,
+            "hasEquipCount": state.has_equip_count,
+            "hasSubmit": state.has_submit,
+            "submitDisabled": state.submit_disabled,
+            "selectableCount": state.selectable_count,
+            "selectedCount": state.selected_count,
+            "empty": state.empty,
+            "rowCount": state.row_count,
+            "errorText": state.error_text,
+        }
+
+    async def query_selector(self, selector: str) -> _Element | None:
+        if selector == "#equipform #equipcount":
+            return self.count if self.repair_count > 0 else None
+        if selector == "#equipform #equipsubmit":
+            return self.submit
+        raise AssertionError(f"unexpected selector: {selector}")
+
+
+def _client(page: _Page) -> tuple[EquipmentRepairClient, AsyncMock]:
+    realm = AsyncMock(return_value=Realm.PERSISTENT)
+    driver = type("Driver", (), {"page": page})()
+    client = EquipmentRepairClient(
+        driver,  # type: ignore[arg-type]
+        type("RealmNavigator", (), {"current": realm})(),  # type: ignore[arg-type]
     )
-
-
-def _equipment_state(
-    count: int | None,
-    *,
-    empty: bool = False,
-    row_count: int | None = 0,
-) -> dict[str, object]:
-    return {
-        "hasEquipForm": True,
-        "hasEquipList": True,
-        "selectableCount": count,
-        "empty": empty,
-        "rowCount": row_count,
-    }
-
-
-def _client(
-    xpath_results: list[object],
-    *,
-    equipment_states: list[object] | None = None,
-    submit_disabled: list[object] | None = None,
-    urls: list[object] | None = None,
-    realm: Realm = Realm.PERSISTENT,
-) -> tuple[
-    EquipmentRepairClient,
-    SimpleNamespace,
-    SimpleNamespace,
-]:
-    landing_urls = list(urls or [])
-    current_url = _ISEKAI_ROOT_URL if realm is Realm.ISEKAI else _PERSISTENT_ROOT_URL
-    state_results = iter(equipment_states or [])
-    disabled_results = iter(submit_disabled or [])
-
-    async def evaluate(script: str) -> object:
-        if script == repair_module._EQUIPMENT_STATE_SCRIPT:
-            return next(state_results)
-        if script == "document.getElementById('equipsubmit').disabled":
-            return next(disabled_results)
-        if "nextFloor" in script and "battle_main" in script:
-            return {
-                "url": current_url,
-                "challenge": False,
-                "completion": False,
-                "nextFloor": False,
-                "active": False,
-            }
-        if "JSON.stringify" in script:
-            return "{}"
-        raise AssertionError(f"Unexpected evaluate script: {script!r}")
-
-    async def get(url: str) -> None:
-        nonlocal current_url
-        current_url = landing_urls.pop(0) if landing_urls else url
-
-    page = SimpleNamespace(
-        xpath=AsyncMock(side_effect=xpath_results),
-        evaluate=AsyncMock(side_effect=evaluate),
-        wait=AsyncMock(),
-    )
-    driver = SimpleNamespace(
-        page=page,
-        get=AsyncMock(side_effect=get),
-        wait=AsyncMock(),
-    )
-    realm_navigator = SimpleNamespace(current=AsyncMock(return_value=realm))
-    return (
-        EquipmentRepairClient(driver, realm_navigator),
-        driver,
-        realm_navigator,
-    )
+    return client, realm
 
 
 class EquipmentRepairClientTests(unittest.IsolatedAsyncioTestCase):
-    async def test_inspect_accepts_localized_text_and_returns_count(self) -> None:
-        selected = _element("维修")
-        count = _element("已选择 0 / 3 件符合条件的装备")
-        client, driver, realm_navigator = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(3, row_count=3)],
-            realm=Realm.ISEKAI,
-        )
-
-        snapshot = await client.inspect()
-
-        self.assertEqual(snapshot, EquipmentRepairSnapshot(Realm.ISEKAI, 3))
-        realm_navigator.current.assert_awaited_once_with()
-        driver.get.assert_awaited_once_with(_ISEKAI_REPAIR_URL)
-        driver.wait.assert_not_awaited()
-
-    async def test_repair_navigation_does_not_probe_menu_visibility(self) -> None:
-        selected = _element("Repair")
-        count = _element()
-        client, driver, _realm = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(0)],
-        )
-
-        report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.page.wait.assert_not_awaited()
-        driver.wait.assert_not_awaited()
-
-    async def test_direct_navigation_uses_single_canonical_get(self) -> None:
-        selected = _element("Repair")
-        count = _element()
-        client, driver, _realm = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(0)],
-        )
-
-        report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        self.assertEqual(driver.get.await_count, 1)
-
-    async def test_each_realm_uses_realm_scoped_direct_url(self) -> None:
+    async def test_navigation_rejects_wrong_realm_and_path(self) -> None:
+        page = _Page()
+        client, _ = _client(page)
         cases = (
-            (Realm.PERSISTENT, _PERSISTENT_REPAIR_URL),
-            (Realm.ISEKAI, _ISEKAI_REPAIR_URL),
-        )
-        for realm, expected_url in cases:
-            with self.subTest(realm=realm):
-                selected = _element("Repair")
-                count = _element()
-                client, driver, _realm = _client(
-                    [[selected], [selected], [count]],
-                    equipment_states=[_equipment_state(0)],
-                    realm=realm,
-                )
-
-                report = await client.repair_all()
-
-                self.assertIs(
-                    report.outcome,
-                    EquipmentRepairOutcome.NO_REPAIR_NEEDED,
-                )
-                driver.get.assert_awaited_once_with(expected_url)
-                driver.wait.assert_not_awaited()
-
-    async def test_direct_repair_route_is_verified_after_navigation(self) -> None:
-        selected = _element("Repair")
-        count = _element()
-        client, driver, _realm = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(0)],
+            MaintenanceNavigationObservation(
+                "https://hentaiverse.org/isekai/",
+                Realm.ISEKAI,
+                None,
+            ),
+            MaintenanceNavigationObservation(
+                "https://hentaiverse.org/untrusted/path",
+                Realm.PERSISTENT,
+                None,
+            ),
         )
 
-        report = await client.repair_all()
+        for observation in cases:
+            with (
+                self.subTest(observation=observation),
+                patch(
+                    "hvbrowser.equipment_repair.observe_maintenance_navigation",
+                    new=AsyncMock(return_value=observation),
+                ),
+                self.assertRaises(EquipmentRepairPageError),
+            ):
+                await client._ensure_navigation_is_safe(
+                    Realm.PERSISTENT,
+                    "test",
+                )
 
-        self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        self.assertEqual(driver.page.xpath.await_count, 3)
+    async def test_each_battle_blocker_stops_before_navigation(self) -> None:
+        for blocker in MaintenanceNavigationBlocker:
+            page = _Page()
+            driver = SimpleNamespace(page=page, get=AsyncMock())
+            client = EquipmentRepairClient(  # type: ignore[arg-type]
+                driver,
+                SimpleNamespace(current=AsyncMock(return_value=Realm.PERSISTENT)),
+            )
+            observation = MaintenanceNavigationObservation(
+                "https://hentaiverse.org/",
+                Realm.PERSISTENT,
+                blocker,
+            )
+            with (
+                self.subTest(blocker=blocker),
+                patch(
+                    "hvbrowser.equipment_repair.observe_maintenance_navigation",
+                    new=AsyncMock(return_value=observation),
+                ),
+                self.assertRaises(MaintenanceNavigationBlockedError),
+            ):
+                await client._open_repair_directly(Realm.PERSISTENT)
+            driver.get.assert_not_awaited()
 
-    async def test_missing_selected_marker_after_direct_navigation_is_terminal(
-        self,
-    ) -> None:
-        client, driver, _realm = _client([[]])
+    async def test_each_battle_blocker_after_get_stops_without_page_probe(self) -> None:
+        for blocker in MaintenanceNavigationBlocker:
+            page = _Page()
+            page.evaluate = AsyncMock(wraps=page.evaluate)
+            driver = SimpleNamespace(page=page, get=AsyncMock())
+            client = EquipmentRepairClient(  # type: ignore[arg-type]
+                driver,
+                SimpleNamespace(current=AsyncMock(return_value=Realm.PERSISTENT)),
+            )
+            observations = [
+                MaintenanceNavigationObservation(
+                    "https://hentaiverse.org/",
+                    Realm.PERSISTENT,
+                    None,
+                ),
+                MaintenanceNavigationObservation(
+                    "https://hentaiverse.org/?s=Bazaar&ss=am&screen=repair",
+                    Realm.PERSISTENT,
+                    blocker,
+                ),
+            ]
+            with (
+                self.subTest(blocker=blocker),
+                patch(
+                    "hvbrowser.equipment_repair.observe_maintenance_navigation",
+                    new=AsyncMock(side_effect=observations),
+                ),
+                self.assertRaises(MaintenanceNavigationBlockedError),
+            ):
+                await client._open_repair_directly(Realm.PERSISTENT)
+            driver.get.assert_awaited_once()
+            page.evaluate.assert_not_awaited()
 
-        with self.assertRaisesRegex(EquipmentRepairPageError, "selected-tab marker"):
-            await client.repair_all()
-
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        self.assertTrue(
-            any(
-                "window.location.href" in call.args[0] and "battle_main" in call.args[0]
-                for call in driver.page.evaluate.await_args_list
+    async def test_direct_get_generation_timeout_has_no_post_probe(self) -> None:
+        page = _Page()
+        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
+        driver = SimpleNamespace(page=page, get=AsyncMock(side_effect=timeout))
+        client = EquipmentRepairClient(  # type: ignore[arg-type]
+            driver,
+            SimpleNamespace(current=AsyncMock(return_value=Realm.PERSISTENT)),
+        )
+        observe = AsyncMock(
+            return_value=MaintenanceNavigationObservation(
+                "https://hentaiverse.org/",
+                Realm.PERSISTENT,
+                None,
             )
         )
-        self.assertNotIn(
-            repair_module._EQUIPMENT_STATE_SCRIPT,
-            [call.args[0] for call in driver.page.evaluate.await_args_list],
-        )
-
-    async def test_selected_marker_read_error_is_not_retried(
-        self,
-    ) -> None:
-        client, driver, _realm = _client([RuntimeError("selected marker read failed")])
-
-        with self.assertRaisesRegex(
-            EquipmentRepairPageError,
-            "Unable to verify",
-        ):
-            await client.repair_all()
-
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        self.assertEqual(driver.get.await_count, 1)
-
-    async def test_organize_controls_are_never_used_as_repair_controls(self) -> None:
-        organize_count = _element("Selected 0 of 4 matching")
-        organize_submit = _element("Organize Equipment")
-        client, driver, _realm = _client([[]])
-
-        with self.assertRaises(EquipmentRepairPageError):
-            await client.repair_all()
-
-        organize_count.mouse_click.assert_not_awaited()
-        organize_submit.mouse_click.assert_not_awaited()
-        self.assertEqual(driver.get.await_count, 1)
-        evaluated_scripts = [
-            item.args[0] for item in driver.page.evaluate.await_args_list
-        ]
-        self.assertNotIn(repair_module._EQUIPMENT_STATE_SCRIPT, evaluated_scripts)
-        self.assertNotIn(
-            "document.getElementById('equipsubmit').disabled",
-            evaluated_scripts,
-        )
-
-    async def test_each_battle_state_blocks_after_direct_landing(self) -> None:
-        for blocker in MaintenanceNavigationBlocker:
-            with self.subTest(blocker=blocker):
-                client, driver, _realm = _client([])
-
-                with (
-                    patch.object(
-                        repair_module,
-                        "observe_maintenance_navigation",
-                        new=AsyncMock(
-                            side_effect=[
-                                _observation(),
-                                _observation(blocker=blocker),
-                            ]
-                        ),
-                    ),
-                    self.assertRaises(MaintenanceNavigationBlockedError) as raised,
-                ):
-                    await client.repair_all()
-
-                self.assertIs(raised.exception.blocker, blocker)
-                driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-
-    async def test_each_battle_state_blocks_before_direct_navigation(self) -> None:
-        for blocker in MaintenanceNavigationBlocker:
-            with self.subTest(blocker=blocker):
-                client, driver, _realm = _client([])
-
-                with (
-                    patch.object(
-                        repair_module,
-                        "observe_maintenance_navigation",
-                        new=AsyncMock(return_value=_observation(blocker=blocker)),
-                    ),
-                    self.assertRaises(MaintenanceNavigationBlockedError) as raised,
-                ):
-                    await client.repair_all()
-
-                self.assertIs(raised.exception.blocker, blocker)
-                driver.get.assert_not_awaited()
-
-    async def test_untrusted_identity_wins_over_marker_before_and_after_get(
-        self,
-    ) -> None:
-        unsafe_observations = (
-            MaintenanceNavigationObservation(
-                "https://example.test/",
-                None,
-                MaintenanceNavigationBlocker.ACTIVE,
-            ),
-            MaintenanceNavigationObservation(
-                "https://hentaiverse.org:0/",
-                None,
-                MaintenanceNavigationBlocker.ACTIVE,
-            ),
-            _observation(
-                realm=Realm.ISEKAI,
-                blocker=MaintenanceNavigationBlocker.ACTIVE,
-            ),
-            _observation(
-                url="https://hentaiverse.org/unexpected",
-                blocker=MaintenanceNavigationBlocker.ACTIVE,
-            ),
-        )
-        for after_get in (False, True):
-            for unsafe in unsafe_observations:
-                with self.subTest(after_get=after_get, url=unsafe.url):
-                    client, driver, _realm = _client([])
-                    observations = [_observation(), unsafe] if after_get else [unsafe]
-
-                    with (
-                        patch.object(
-                            repair_module,
-                            "observe_maintenance_navigation",
-                            new=AsyncMock(side_effect=observations),
-                        ),
-                        self.assertRaises(EquipmentRepairPageError) as raised,
-                    ):
-                        await client.repair_all()
-
-                    self.assertNotIsInstance(
-                        raised.exception,
-                        MaintenanceNavigationBlockedError,
-                    )
-                    if after_get:
-                        driver.get.assert_awaited_once()
-                    else:
-                        driver.get.assert_not_awaited()
-
-    async def test_each_battle_state_appearing_before_inspection_stops_safely(
-        self,
-    ) -> None:
-        for blocker in MaintenanceNavigationBlocker:
-            with self.subTest(blocker=blocker):
-                selected = _element("Repair")
-                client, driver, _realm = _client([[selected]])
-
-                with (
-                    patch.object(
-                        repair_module,
-                        "observe_maintenance_navigation",
-                        new=AsyncMock(
-                            side_effect=[
-                                _observation(),
-                                _observation(url=_PERSISTENT_REPAIR_URL),
-                                _observation(
-                                    url=_PERSISTENT_REPAIR_URL,
-                                    blocker=blocker,
-                                ),
-                            ]
-                        ),
-                    ),
-                    self.assertRaises(MaintenanceNavigationBlockedError) as raised,
-                ):
-                    await client.repair_all()
-
-                self.assertIs(raised.exception.blocker, blocker)
-                driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-                self.assertNotIn(
-                    repair_module._EQUIPMENT_STATE_SCRIPT,
-                    [call.args[0] for call in driver.page.evaluate.await_args_list],
-                )
-
-    async def test_unknown_battle_state_after_direct_landing_is_terminal(self) -> None:
-        client, driver, _realm = _client([])
 
         with (
-            patch.object(
-                repair_module,
-                "observe_maintenance_navigation",
-                new=AsyncMock(
-                    side_effect=[_observation(), RuntimeError("unreadable DOM")]
-                ),
+            patch(
+                "hvbrowser.equipment_repair.observe_maintenance_navigation",
+                new=observe,
             ),
-            self.assertRaisesRegex(EquipmentRepairPageError, "battle state"),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
-            await client.repair_all()
-
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-
-    async def test_public_direct_timeout_is_terminal_without_post_failure_probe(
-        self,
-    ) -> None:
-        client, driver, _realm = _client([])
-        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
-        driver.get.side_effect = timeout
-
-        with self.assertRaises(ZendriverOperationTimeout) as raised:
-            await client.repair_all()
-
-        self.assertIs(raised.exception, timeout)
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.page.evaluate.assert_awaited_once()
-        driver.page.xpath.assert_not_awaited()
-
-    async def test_direct_navigation_timeout_has_no_post_failure_probe(self) -> None:
-        client, driver, _realm = _client([])
-        timeout = ZendriverOperationTimeout(timeout_seconds=0.01)
-        driver.get.side_effect = timeout
-
-        with self.assertRaises(ZendriverOperationTimeout) as raised:
             await client._open_repair_directly(Realm.PERSISTENT)
 
         self.assertIs(raised.exception, timeout)
-        driver.page.evaluate.assert_awaited_once()
+        self.assertEqual(observe.await_count, 1)
 
-    async def test_direct_get_error_prefers_detected_battle_block(self) -> None:
-        client, driver, _realm = _client([])
-        navigation_error = RuntimeError("navigation interrupted")
-        driver.get.side_effect = navigation_error
-
-        with (
-            patch.object(
-                repair_module,
-                "observe_maintenance_navigation",
-                new=AsyncMock(
-                    side_effect=[
-                        _observation(),
-                        _observation(blocker=MaintenanceNavigationBlocker.ACTIVE),
-                    ]
-                ),
-            ),
-            self.assertRaises(MaintenanceNavigationBlockedError) as raised,
-        ):
-            await client.repair_all()
-
-        self.assertIs(raised.exception.blocker, MaintenanceNavigationBlocker.ACTIVE)
-        self.assertIs(raised.exception.__cause__, navigation_error)
-
-    async def test_direct_navigation_rejects_wrong_realm(self) -> None:
-        client, driver, _realm = _client(
-            [],
-            urls=[_PERSISTENT_REPAIR_URL],
-            realm=Realm.ISEKAI,
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "wrong realm"):
-            await client.repair_all()
-
-        driver.get.assert_awaited_once_with(_ISEKAI_REPAIR_URL)
-
-    async def test_direct_navigation_rejects_wrong_repair_query(self) -> None:
-        organize_url = "https://hentaiverse.org/?s=Bazaar&ss=am&screen=organize"
-        client, driver, _realm = _client(
-            [],
-            urls=[organize_url],
+    async def test_wrong_repair_query_fails_before_dom_state_probe(self) -> None:
+        page = _Page()
+        page.evaluate = AsyncMock(wraps=page.evaluate)
+        client, _ = _client(page)
+        client._ensure_navigation_is_safe = AsyncMock(  # type: ignore[method-assign]
+            return_value=MaintenanceNavigationObservation(
+                "https://hentaiverse.org/?s=Bazaar&ss=am&screen=shop",
+                Realm.PERSISTENT,
+                None,
+            )
         )
 
         with self.assertRaisesRegex(EquipmentRepairPageError, "Repair route"):
-            await client.repair_all()
+            await client._verify_repair_destination(Realm.PERSISTENT)
 
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.page.xpath.assert_not_awaited()
+        page.evaluate.assert_not_awaited()
 
-    async def test_direct_navigation_rejects_non_equipped_filter(self) -> None:
-        new_filter_url = (
-            "https://hentaiverse.org/" "?s=Bazaar&ss=am&screen=repair&filter=new"
+    async def test_each_realm_uses_its_scoped_direct_url(self) -> None:
+        expected = {
+            Realm.PERSISTENT: "https://hentaiverse.org/?s=Bazaar&ss=am&screen=repair&filter=equipped",
+            Realm.ISEKAI: "https://hentaiverse.org/isekai/?s=Bazaar&ss=am&screen=repair&filter=equipped",
+        }
+        for realm, url in expected.items():
+            page = _Page(repair_count=0)
+            driver = SimpleNamespace(page=page, get=AsyncMock())
+            client = EquipmentRepairClient(  # type: ignore[arg-type]
+                driver,
+                SimpleNamespace(current=AsyncMock(return_value=realm)),
+            )
+            root = (
+                "https://hentaiverse.org/isekai/"
+                if realm is Realm.ISEKAI
+                else "https://hentaiverse.org/"
+            )
+            observations = [
+                MaintenanceNavigationObservation(root, realm, None),
+                MaintenanceNavigationObservation(url, realm, None),
+            ]
+            with (
+                self.subTest(realm=realm),
+                patch(
+                    "hvbrowser.equipment_repair.observe_maintenance_navigation",
+                    new=AsyncMock(side_effect=observations),
+                ),
+            ):
+                await client._open_repair_directly(realm)
+            driver.get.assert_awaited_once_with(url)
+
+    async def test_empty_and_missing_count_states_fail_closed(self) -> None:
+        page = _Page(repair_count=0)
+        client, _ = _client(page)
+        empty, control = await client._inspect_current(
+            Realm.PERSISTENT,
+            state=page.state(),
         )
-        client, driver, _realm = _client(
-            [],
-            urls=[new_filter_url],
+        self.assertEqual(empty.repair_count, 0)
+        self.assertIsNone(control)
+
+        invalid = replace(
+            page.state(),
+            has_equip_count=False,
+            selectable_count=2,
+            empty=False,
+            row_count=2,
+        )
+        with self.assertRaisesRegex(EquipmentRepairPageError, "missing"):
+            await client._inspect_current(Realm.PERSISTENT, state=invalid)
+
+    async def test_malformed_atomic_count_payload_is_rejected(self) -> None:
+        page = _Page()
+        payload = await page.evaluate("state")
+        for value in (-1, "2"):
+            with self.subTest(value=value):
+                page.evaluate = AsyncMock(
+                    return_value={**payload, "selectableCount": value}
+                )
+                client, _ = _client(page)
+                with self.assertRaisesRegex(EquipmentRepairPageError, "invalid"):
+                    await client._read_state()
+
+    async def test_atomic_state_decoder_rejects_missing_selected_marker(self) -> None:
+        page = _Page()
+        payload = await page.evaluate("state")
+        payload["repairSelected"] = False
+        page.evaluate = AsyncMock(return_value=payload)
+        client, _ = _client(page)
+        client._ensure_navigation_is_safe = AsyncMock(  # type: ignore[method-assign]
+            return_value=MaintenanceNavigationObservation(
+                "https://hentaiverse.org/?s=Bazaar&ss=am&screen=repair&filter=equipped",
+                Realm.PERSISTENT,
+                None,
+            )
         )
 
-        with self.assertRaisesRegex(EquipmentRepairPageError, "Equipped filter"):
-            await client.repair_all()
+        with self.assertRaisesRegex(EquipmentRepairPageError, "selected-tab"):
+            await client._verify_repair_destination(Realm.PERSISTENT)
 
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.page.xpath.assert_not_awaited()
-
-    async def test_direct_navigation_rejects_unexpected_path(self) -> None:
-        wrong_path = "https://hentaiverse.org/battle" "?s=Bazaar&ss=am&screen=repair"
-        client, driver, _realm = _client(
-            [],
-            urls=[wrong_path],
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "unexpected path"):
-            await client.repair_all()
-
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-        driver.page.xpath.assert_not_awaited()
-
-    async def test_reordered_repair_query_is_accepted(self) -> None:
-        selected = _element("Repair")
-        count = _element()
-        reordered_url = "https://hentaiverse.org/?screen=repair&extra=1&ss=am&s=Bazaar"
-        client, driver, _realm = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(0)],
-            urls=[reordered_url],
-        )
+    async def test_no_matching_equipment_is_ready_without_mutation(self) -> None:
+        page = _Page(repair_count=0)
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
 
         report = await client.repair_all()
 
         self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-
-    async def test_no_matching_equipment_is_ready_without_submission(self) -> None:
-        selected = _element("Repair")
-        count = _element()
-        client, driver, _realm = _client(
-            [[selected], [selected], [count]],
-            equipment_states=[_equipment_state(0)],
-        )
-
-        report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        self.assertTrue(report.ready)
-        self.assertEqual(report.before.repair_count, 0)
-        self.assertEqual(report.after, report.before)
-        evaluated_scripts = [
-            item.args[0] for item in driver.page.evaluate.await_args_list
-        ]
-        self.assertNotIn(
-            "document.getElementById('equipsubmit').disabled",
-            evaluated_scripts,
-        )
-
-    async def test_empty_equipment_list_without_count_is_zero(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [[selected], [selected], []],
-            equipment_states=[_equipment_state(None, empty=True)],
-        )
-
-        report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.NO_REPAIR_NEEDED)
-        self.assertEqual(report.before.repair_count, 0)
-
-    async def test_missing_count_without_empty_list_fails_closed(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [[selected], [selected], []],
-            equipment_states=[_equipment_state(None)],
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "empty equipment"):
-            await client.repair_all()
-
-    async def test_empty_marker_with_rows_fails_closed(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [[selected], [selected], []],
-            equipment_states=[_equipment_state(None, empty=True, row_count=1)],
-        )
-
-        with self.assertRaises(EquipmentRepairPageError):
-            await client.repair_all()
-
-    async def test_repair_all_confirms_zero_remaining_items(self) -> None:
-        selected = _element("Repair")
-        before = _element()
-        submit = _element()
-        after = _element()
-        client, driver, _realm = _client(
-            [
-                [selected],
-                [selected],
-                [before],
-                [submit],
-                [selected],
-                [after],
-            ],
-            equipment_states=[
-                _equipment_state(3, row_count=3),
-                _equipment_state(0),
-            ],
-            submit_disabled=[False],
-        )
-
-        report = await client.repair_all(EquipmentRepairSnapshot(Realm.PERSISTENT, 3))
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.REPAIRED)
-        self.assertTrue(report.ready)
-        self.assertEqual(report.after.repair_count, 0)
-        submit.mouse_click.assert_awaited_once_with()
-        driver.page.wait.assert_awaited_once_with(2)
-        driver.wait.assert_awaited_once_with(
-            before.mouse_click,
-            ischangeurl=False,
-            owner=before,
-            operation_timeout=15.0,
-        )
-
-    async def test_disabled_submit_is_rechecked_from_fresh_state(self) -> None:
-        selected_1 = _element("Repair")
-        selected_2 = _element("Repair")
-        before = _element()
-        first_submit = _element()
-        fresh = _element()
-        second_submit = _element()
-        client, driver, _realm = _client(
-            [
-                [selected_1],
-                [selected_1],
-                [before],
-                [first_submit],
-                [selected_2],
-                [selected_2],
-                [fresh],
-                [second_submit],
-            ],
-            equipment_states=[_equipment_state(2), _equipment_state(2)],
-            submit_disabled=[True, True],
-        )
-
-        with patch.object(repair_module.logger, "isEnabledFor", return_value=False):
-            report = await client.repair_all()
-
-        self.assertIs(
-            report.outcome,
-            EquipmentRepairOutcome.MATERIALS_UNAVAILABLE,
-        )
-        self.assertFalse(report.ready)
-        self.assertEqual(driver.get.await_count, 2)
-        first_submit.mouse_click.assert_not_awaited()
-        second_submit.mouse_click.assert_not_awaited()
-        driver.page.wait.assert_not_awaited()
-
-    async def test_stale_disabled_state_can_recover_and_submit(self) -> None:
-        selected_1 = _element("Repair")
-        selected_2 = _element("Repair")
-        before = _element()
-        first_submit = _element()
-        fresh = _element()
-        second_submit = _element()
-        after = _element()
-        client, _driver, _realm = _client(
-            [
-                [selected_1],
-                [selected_1],
-                [before],
-                [first_submit],
-                [selected_2],
-                [selected_2],
-                [fresh],
-                [second_submit],
-                [selected_2],
-                [after],
-            ],
-            equipment_states=[
-                _equipment_state(2),
-                _equipment_state(2),
-                _equipment_state(0),
-            ],
-            submit_disabled=[True, False],
-        )
-
-        with patch.object(repair_module.logger, "isEnabledFor", return_value=False):
-            report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.REPAIRED)
-        self.assertTrue(report.ready)
-        first_submit.mouse_click.assert_not_awaited()
-        second_submit.mouse_click.assert_awaited_once_with()
-
-    async def test_fresh_retry_detects_concurrent_state_change(self) -> None:
-        selected_1 = _element("Repair")
-        selected_2 = _element("Repair")
-        client, _driver, _realm = _client(
-            [
-                [selected_1],
-                [selected_1],
-                [_element()],
-                [_element()],
-                [selected_2],
-                [selected_2],
-                [_element()],
-            ],
-            equipment_states=[_equipment_state(2), _equipment_state(1)],
-            submit_disabled=[True],
-        )
-
-        with patch.object(repair_module.logger, "isEnabledFor", return_value=False):
-            with self.assertRaises(EquipmentRepairStateChangedError):
-                await client.repair_all()
-
-    async def test_invalid_count_state_is_a_typed_page_error(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [[selected], [selected], [_element()]],
-            equipment_states=[_equipment_state(None)],
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "state is invalid"):
-            await client.inspect()
-
-    async def test_boolean_count_state_is_rejected(self) -> None:
-        selected = _element("Repair")
-        invalid_state = _equipment_state(None)
-        invalid_state["selectableCount"] = True
-        client, _driver, _realm = _client(
-            [[selected], [selected], [_element()]],
-            equipment_states=[invalid_state],
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "state is invalid"):
-            await client.inspect()
-
-    async def test_missing_submit_is_a_typed_page_error(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [
-                [selected],
-                [selected],
-                [_element()],
-                [],
-            ],
-            equipment_states=[_equipment_state(1)],
-        )
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "submit button"):
-            await client.repair_all()
-
-    async def test_disappearing_count_with_empty_list_confirms_repair(self) -> None:
-        selected = _element("Repair")
-        submit = _element()
-        client, _driver, _realm = _client(
-            [
-                [selected],
-                [selected],
-                [_element()],
-                [submit],
-                [selected],
-                [],
-            ],
-            equipment_states=[
-                _equipment_state(1),
-                _equipment_state(None, empty=True),
-            ],
-            submit_disabled=[False],
-        )
-
-        report = await client.repair_all()
-
-        self.assertIs(report.outcome, EquipmentRepairOutcome.REPAIRED)
-        self.assertEqual(report.after.repair_count, 0)
-
-    async def test_wrong_page_after_navigation_fails_without_fallback(self) -> None:
-        selected = _element("Repair")
-        client, driver, _realm = _client([[selected], []])
-
-        with self.assertRaisesRegex(EquipmentRepairPageError, "selected-tab marker"):
-            await client.inspect()
-
-        driver.get.assert_awaited_once_with(_PERSISTENT_REPAIR_URL)
-
-    async def test_wrong_post_submit_page_is_an_unknown_outcome(self) -> None:
-        selected = _element("Repair")
-        client, _driver, _realm = _client(
-            [
-                [selected],
-                [selected],
-                [_element()],
-                [_element()],
-                [],
-            ],
-            equipment_states=[_equipment_state(1)],
-            submit_disabled=[False],
-        )
-
-        with self.assertRaisesRegex(
-            EquipmentRepairSubmissionError,
-            "Unable to confirm",
-        ):
-            await client.repair_all()
+        self.assertEqual(page.count.clicks, 0)
+        self.assertEqual(page.submit.clicks, 0)
 
     async def test_expected_snapshot_prevents_stale_submission(self) -> None:
-        selected = _element("Repair")
-        client, driver, _realm = _client(
-            [[selected], [selected], [_element()]],
-            equipment_states=[_equipment_state(1)],
-        )
+        page = _Page(repair_count=3)
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
 
         with self.assertRaises(EquipmentRepairStateChangedError):
             await client.repair_all(EquipmentRepairSnapshot(Realm.PERSISTENT, 2))
 
-        evaluated_scripts = [
-            item.args[0] for item in driver.page.evaluate.await_args_list
-        ]
-        self.assertNotIn(
-            "document.getElementById('equipsubmit').disabled",
-            evaluated_scripts,
+        self.assertEqual(page.submit.clicks, 0)
+
+    async def test_repair_submits_once_and_confirms_zero(self) -> None:
+        page = _Page(repair_count=2)
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
+
+        report = await client.repair_all(EquipmentRepairSnapshot(Realm.PERSISTENT, 2))
+
+        self.assertIs(report.outcome, EquipmentRepairOutcome.REPAIRED)
+        self.assertEqual(report.after.repair_count, 0)
+        self.assertEqual(page.count.clicks, 1)
+        self.assertEqual(page.submit.clicks, 1)
+
+    async def test_materials_unavailable_is_rechecked_from_fresh_state(self) -> None:
+        page = _Page(repair_count=2)
+        page.submit_disabled = True
+        client, _ = _client(page)
+        client._navigate = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[page.state(), page.state()]
         )
+
+        report = await client.repair_all()
+
+        self.assertIs(report.outcome, EquipmentRepairOutcome.MATERIALS_UNAVAILABLE)
+        self.assertEqual(page.count.clicks, 2)
+        self.assertEqual(page.submit.clicks, 0)
+
+    async def test_fresh_material_check_rejects_concurrent_count_change(self) -> None:
+        page = _Page(repair_count=2)
+        page.submit_disabled = True
+        client, _ = _client(page)
+        changed = replace(page.state(), selectable_count=3, row_count=3)
+        client._navigate = AsyncMock(  # type: ignore[method-assign]
+            side_effect=[page.state(), changed]
+        )
+
+        with self.assertRaises(EquipmentRepairStateChangedError):
+            await client.repair_all()
+
+        self.assertEqual(page.submit.clicks, 0)
+
+    async def test_submit_failure_is_unknown_without_replay(self) -> None:
+        page = _Page(repair_count=2)
+        page.submit_error = RuntimeError("disconnected")
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
+
+        with self.assertRaises(BrowserMutationOutcomeUnknownError):
+            await client.repair_all()
+
+        self.assertEqual(page.submit.clicks, 1)
+
+    async def test_server_rejection_is_typed_without_replay(self) -> None:
+        page = _Page(repair_count=2)
+        page.server_rejection = "Insufficient materials"
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(
+            EquipmentRepairSubmissionError, "Insufficient materials"
+        ):
+            await client.repair_all()
+
+        self.assertEqual(page.submit.clicks, 1)
+
+    async def test_delayed_success_does_not_replay_submission(self) -> None:
+        page = _Page(repair_count=2)
+        page.keep_after_submit = True
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
+        completed = _EquipmentPageState(
+            True,
+            True,
+            True,
+            True,
+            False,
+            True,
+            False,
+            0,
+            0,
+            True,
+            0,
+            None,
+        )
+
+        with patch(
+            "hvbrowser.equipment_repair.wait_for_page_state",
+            new=AsyncMock(return_value=completed),
+        ):
+            report = await client.repair_all()
+
+        self.assertIs(report.outcome, EquipmentRepairOutcome.REPAIRED)
+        self.assertEqual(page.submit.clicks, 1)
+
+    async def test_semantic_timeout_is_unknown_without_replay(self) -> None:
+        page = _Page(repair_count=2)
+        page.keep_after_submit = True
+        client, _ = _client(page)
+        client._navigate = AsyncMock(return_value=page.state())  # type: ignore[method-assign]
+
+        selected = _EquipmentPageState(
+            True, True, True, True, True, True, False, 2, 2, False, 2, None
+        )
+        with (
+            patch(
+                "hvbrowser.equipment_repair.wait_for_page_state",
+                new=AsyncMock(side_effect=[selected, PageStateTimeout("unchanged")]),
+            ) as state_wait,
+            self.assertRaises(EquipmentRepairSubmissionError),
+        ):
+            await client.repair_all()
+
+        self.assertEqual(state_wait.await_count, 2)
+        self.assertEqual(page.submit.clicks, 1)
 
 
 if __name__ == "__main__":

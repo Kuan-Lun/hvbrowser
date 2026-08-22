@@ -1,4 +1,5 @@
 import asyncio
+import time
 import unittest
 from collections.abc import Awaitable, Callable, Collection, Iterator
 from contextlib import contextmanager
@@ -6,7 +7,10 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from unittest.mock import AsyncMock, patch
 
+from hbrowser import ProcessOwnershipError
+
 from hvbrowser.account_context import (
+    AccountContextCloseTimeout,
     AccountContextStartupStopped,
     AccountContextState,
     AccountContextStateError,
@@ -441,7 +445,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         should_hang = True
 
         with patch(
-            "hvbrowser.account_context._CURRENT_URL_TIMEOUT_SECONDS",
+            "hvbrowser.account_context.PROTOCOL_COMMAND_TIMEOUT_SECONDS",
             0.01,
         ):
             reading = asyncio.create_task(context.persistent.current_realm())
@@ -618,7 +622,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         async def fail_authentication(_: RealmBoundHVDriver) -> None:
             raise PermissionError("login failed")
 
-        async def close_browser(_: _FakeBrowser) -> None:
+        async def close_browser(_: _FakeBrowser, __: object) -> None:
             close_started.set()
             await allow_close.wait()
 
@@ -648,7 +652,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         close_started = asyncio.Event()
         allow_close = asyncio.Event()
 
-        async def close_browser(_: _FakeBrowser) -> None:
+        async def close_browser(_: _FakeBrowser, __: object) -> None:
             close_started.set()
             await allow_close.wait()
 
@@ -672,6 +676,176 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(context.state, AccountContextState.CLOSED)
         browser_closer.assert_awaited_once()
+
+    async def test_close_deadline_is_bound_to_the_shared_ownership_task(self) -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        async def close_browser(_: _FakeBrowser, __: object) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+        context, _, _, _, browser_closer, _ = self._context()
+        browser_closer.side_effect = close_browser
+        await context.start()
+
+        with patch("hvbrowser.account_context._ACCOUNT_CLOSE_TIMEOUT_SECONDS", 0.01):
+            first_close = asyncio.create_task(context.close())
+            await close_started.wait()
+            second_close = asyncio.create_task(context.close())
+            failures = await asyncio.gather(
+                first_close,
+                second_close,
+                return_exceptions=True,
+            )
+
+        for failure in failures:
+            self.assertIsInstance(failure, AccountContextCloseTimeout)
+            self.assertIsInstance(failure, ProcessOwnershipError)
+            self.assertIn("ownership remains unresolved", str(failure))
+        browser_closer.assert_awaited_once()
+
+        allow_close.set()
+        await context.close()
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(browser_closer.await_count, 2)
+
+    async def test_outer_absolute_close_deadline_is_forwarded_to_owner(self) -> None:
+        context, _, _, _, browser_closer, _ = self._context()
+        await context.start()
+        deadline_at = time.monotonic() + 1.0
+
+        await context.close(deadline_at=deadline_at)
+
+        await_args = browser_closer.await_args
+        self.assertIsNotNone(await_args)
+        assert await_args is not None
+        owner_deadline = await_args.args[1]
+        self.assertLessEqual(owner_deadline.expires_at, deadline_at)
+        self.assertGreater(owner_deadline.expires_at, time.monotonic())
+
+    async def test_invalid_outer_close_deadline_is_rejected_before_cleanup(
+        self,
+    ) -> None:
+        context, _, _, _, browser_closer, _ = self._context()
+        await context.start()
+
+        with self.assertRaisesRegex(ValueError, "finite monotonic"):
+            await context.close(deadline_at=float("inf"))
+
+        browser_closer.assert_not_awaited()
+        self.assertIsNone(context._close_task)
+
+    async def test_close_deadline_includes_lifecycle_lock_wait(self) -> None:
+        context, _, _, _, browser_closer, _ = self._context()
+        await context.start()
+        await context._lifecycle_lock.acquire()
+        try:
+            with (
+                patch(
+                    "hvbrowser.account_context._ACCOUNT_CLOSE_TIMEOUT_SECONDS",
+                    0.01,
+                ),
+                self.assertRaisesRegex(
+                    AccountContextCloseTimeout,
+                    "lifecycle ownership",
+                ),
+            ):
+                await context.close()
+        finally:
+            context._lifecycle_lock.release()
+
+        self.assertEqual(context.state, AccountContextState.OPEN)
+        browser_closer.assert_not_awaited()
+        await context.close()
+
+    async def test_joined_close_waiter_keeps_its_generation_deadline_snapshot(
+        self,
+    ) -> None:
+        context, _, _, _, _, _ = self._context()
+        completed = asyncio.create_task(asyncio.sleep(0))
+        await completed
+        context._close_deadline = None
+        context._close_timeout_seconds = None
+        deadline_at = time.monotonic() + 1.0
+
+        cleanup_error, delayed_cancellation = await context._wait_for_close_task(
+            completed,
+            caller_deadline_at=deadline_at,
+            shared_deadline_at=deadline_at,
+            shared_timeout_seconds=1.0,
+        )
+
+        self.assertIsNone(cleanup_error)
+        self.assertIsNone(delayed_cancellation)
+
+    async def test_startup_cleanup_timeout_surfaces_ownership_error(self) -> None:
+        allow_close = asyncio.Event()
+
+        async def fail_authentication(_: RealmBoundHVDriver) -> None:
+            raise PermissionError("login failed")
+
+        async def close_browser(_: _FakeBrowser, __: object) -> None:
+            await allow_close.wait()
+
+        context, _, _, _, browser_closer, _ = self._context(
+            authenticator=fail_authentication
+        )
+        browser_closer.side_effect = close_browser
+
+        with (
+            patch("hvbrowser.account_context._ACCOUNT_CLOSE_TIMEOUT_SECONDS", 0.01),
+            self.assertRaises(ProcessOwnershipError) as raised,
+        ):
+            await context.start()
+
+        self.assertIsInstance(raised.exception.__cause__, PermissionError)
+        allow_close.set()
+        await context.close()
+        self.assertEqual(browser_closer.await_count, 2)
+
+    async def test_completed_ownership_failure_can_be_retried_with_new_deadline(
+        self,
+    ) -> None:
+        failure = ProcessOwnershipError("Chrome ownership unresolved")
+        context, _, _, _, browser_closer, _ = self._context()
+        browser_closer.side_effect = [failure, None]
+        await context.start()
+
+        with self.assertRaises(ProcessOwnershipError) as first:
+            await context.close()
+        self.assertEqual(context.state, AccountContextState.CLOSING)
+        self.assertIsNone(context._close_task)
+        self.assertIsNone(context._close_deadline)
+
+        await context.close()
+
+        self.assertIs(first.exception, failure)
+        self.assertEqual(context.state, AccountContextState.CLOSED)
+        self.assertEqual(browser_closer.await_count, 2)
+
+    async def test_cancelled_close_still_surfaces_unresolved_ownership(self) -> None:
+        close_started = asyncio.Event()
+        allow_close = asyncio.Event()
+
+        async def close_browser(_: _FakeBrowser, __: object) -> None:
+            close_started.set()
+            await allow_close.wait()
+
+        context, _, _, _, browser_closer, _ = self._context()
+        browser_closer.side_effect = close_browser
+        await context.start()
+
+        with patch("hvbrowser.account_context._ACCOUNT_CLOSE_TIMEOUT_SECONDS", 0.01):
+            closing = asyncio.create_task(context.close())
+            await close_started.wait()
+            closing.cancel()
+            with self.assertRaises(ProcessOwnershipError):
+                await closing
+
+        allow_close.set()
+        await context.close()
+        self.assertEqual(browser_closer.await_count, 2)
 
     async def test_close_is_idempotent_and_runtimes_require_open_context(self) -> None:
         context, _, _, _, browser_closer, _ = self._context()

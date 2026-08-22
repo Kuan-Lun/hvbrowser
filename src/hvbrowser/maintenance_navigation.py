@@ -5,9 +5,8 @@ from enum import StrEnum
 from typing import Any, cast
 
 from .realm import Realm, RealmDetectionError, realm_from_url
-from .runtime import wait_for_zendriver
+from .runtime import evaluate_page
 
-_MARKER_READ_TIMEOUT_SECONDS = 8.0
 _MAINTENANCE_NAVIGATION_OBSERVATION_SCRIPT = r"""
 (() => {
     const completion = document.getElementById("pane_completion");
@@ -68,10 +67,9 @@ async def observe_maintenance_navigation(
     page: Any,
 ) -> MaintenanceNavigationObservation:
     """Read and validate page identity and all battle markers atomically."""
-    raw: object = await wait_for_zendriver(
-        page.evaluate(_MAINTENANCE_NAVIGATION_OBSERVATION_SCRIPT),
-        timeout=_MARKER_READ_TIMEOUT_SECONDS,
-        owner=page,
+    raw = await evaluate_page(
+        page,
+        _MAINTENANCE_NAVIGATION_OBSERVATION_SCRIPT,
     )
     if not isinstance(raw, dict):
         raise RuntimeError("Invalid maintenance navigation observation payload")

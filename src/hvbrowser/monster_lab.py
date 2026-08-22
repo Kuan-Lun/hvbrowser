@@ -1,12 +1,9 @@
 """Typed, explicit Monster Lab feed-all browser operations."""
 
-import asyncio
 import json
-import math
-from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from enum import StrEnum
-from typing import Any, Protocol
+from typing import Any, Protocol, cast
 from urllib.parse import parse_qs, urlsplit
 
 from .maintenance_navigation import (
@@ -18,20 +15,18 @@ from .maintenance_navigation import (
 )
 from .realm import Realm
 from .runtime import (
+    SERVER_STATE_RECEIPT_TIMEOUT_SECONDS,
+    Deadline,
+    PageStateTimeout,
+    evaluate_page,
+    invoke_mutation,
     is_browser_generation_error,
     setup_logger,
-    wait_for_zendriver,
+    wait_for_page_state,
 )
 from .urls import HENTAIVERSE_ROOT_URL
 
 logger = setup_logger(__name__)
-
-_READ_TIMEOUT_SECONDS = 8.0
-_MUTATION_TIMEOUT_SECONDS = 15.0
-_SELECTOR_INNER_TIMEOUT_SECONDS = 5.0
-_SELECTOR_OUTER_TIMEOUT_SECONDS = 7.0
-_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS = 2.0
-_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS = 4.0
 
 
 class MonsterLabFeed(StrEnum):
@@ -39,12 +34,22 @@ class MonsterLabFeed(StrEnum):
     DRUGS = "drugs"
 
 
-_FEED_ACTION_NAMES: dict[MonsterLabFeed, str] = {
-    MonsterLabFeed.FOOD: "feed",
-    MonsterLabFeed.DRUGS: "drug",
-}
 _MONSTER_LAB_ROUTE = "ml"
 _MONSTER_LAB_URL = f"{HENTAIVERSE_ROOT_URL}/?s=Bazaar&ss={_MONSTER_LAB_ROUTE}"
+_MONSTER_LAB_STATE_SCRIPT = r"""
+(() => {
+    const actionAvailable = (action) => Boolean(document.querySelector(
+        `img[src="/y/monster/${action}allmonsters.png"]`
+    ));
+    const error = document.querySelector("p.messagebox_error");
+    return {
+        hasApi: typeof do_feed_all === "function",
+        foodAvailable: actionAvailable("feed"),
+        drugsAvailable: actionAvailable("drug"),
+        errorText: error ? error.textContent : null,
+    };
+})()
+"""
 
 
 @dataclass(frozen=True, slots=True)
@@ -78,33 +83,41 @@ class _MonsterLabDriver(Protocol):
     async def get(self, url: str) -> None: ...
 
 
+@dataclass(frozen=True, slots=True)
+class _MonsterLabPageState:
+    has_api: bool
+    available_feed_all: frozenset[MonsterLabFeed]
+    error_text: str | None
+
+
+def _decode_monster_lab_state(raw: object) -> _MonsterLabPageState:
+    if not isinstance(raw, dict):
+        raise MonsterLabPageError("Monster Lab state payload is invalid")
+    payload = cast(dict[object, object], raw)
+    has_api = payload.get("hasApi")
+    food_available = payload.get("foodAvailable")
+    drugs_available = payload.get("drugsAvailable")
+    error_text = payload.get("errorText")
+    if (
+        type(has_api) is not bool
+        or type(food_available) is not bool
+        or type(drugs_available) is not bool
+        or (error_text is not None and not isinstance(error_text, str))
+    ):
+        raise MonsterLabPageError("Monster Lab state payload is invalid")
+    available: set[MonsterLabFeed] = set()
+    if food_available:
+        available.add(MonsterLabFeed.FOOD)
+    if drugs_available:
+        available.add(MonsterLabFeed.DRUGS)
+    return _MonsterLabPageState(has_api, frozenset(available), error_text)
+
+
 class MonsterLabClient:
     """Inspect Monster Lab and invoke one explicit feed-all resource."""
 
-    def __init__(
-        self,
-        driver: _MonsterLabDriver,
-        *,
-        confirmation_checks: int = 5,
-        confirmation_interval: float = 1,
-        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
-    ) -> None:
-        if (
-            not isinstance(confirmation_checks, int)
-            or isinstance(confirmation_checks, bool)
-            or confirmation_checks < 2
-        ):
-            raise ValueError("confirmation_checks must be at least 2")
-        if (
-            isinstance(confirmation_interval, bool)
-            or not math.isfinite(confirmation_interval)
-            or confirmation_interval <= 0
-        ):
-            raise ValueError("confirmation_interval must be a finite positive number")
+    def __init__(self, driver: _MonsterLabDriver) -> None:
         self.driver = driver
-        self.confirmation_checks = confirmation_checks
-        self.confirmation_interval = confirmation_interval
-        self._sleep = sleep
 
     @property
     def page(self) -> Any:
@@ -147,17 +160,19 @@ class MonsterLabClient:
             return MonsterLabFeedReport(resource, False, before, before)
 
         resource_js = json.dumps(resource.value)
+        deadline = Deadline.after(SERVER_STATE_RECEIPT_TIMEOUT_SECONDS)
         try:
-            submitted = await wait_for_zendriver(
-                self.page.evaluate(f"""
+            submitted = await invoke_mutation(
+                lambda: self.page.evaluate(f"""
                     (() => {{
                         if (typeof do_feed_all !== 'function') return false;
                         do_feed_all({resource_js});
                         return true;
                     }})()
                     """),
-                timeout=_MUTATION_TIMEOUT_SECONDS,
                 owner=self.page,
+                operation=f"Monster Lab {resource.value} feed-all",
+                deadline=deadline,
             )
         except Exception as error:
             if is_browser_generation_error(error):
@@ -170,53 +185,32 @@ class MonsterLabClient:
                 f"Monster Lab rejected {resource.value} feed-all"
             )
 
-        last_snapshot: MonsterLabSnapshot | None = None
-        last_error: Exception | None = None
-        consecutive_absences = 0
-        confirmation_error_count = 0
-        last_confirmation_error_type: str | None = None
-        for check in range(self.confirmation_checks):
-            try:
-                await self._sleep(self.confirmation_interval)
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                raise MonsterLabSubmissionError(
-                    f"Unable to confirm Monster Lab {resource.value} feed-all"
-                ) from error
-            try:
-                last_snapshot = await self._inspect_current()
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                last_error = error
-                consecutive_absences = 0
-                confirmation_error_count += 1
-                last_confirmation_error_type = type(error).__name__
-                continue
-            last_error = None
-            if resource not in last_snapshot.available_feed_all:
-                consecutive_absences += 1
-                if consecutive_absences >= 2:
-                    if confirmation_error_count:
-                        logger.warning(
-                            "Monster Lab feed-all confirmation recovered after read "
-                            "errors: resource=%s confirmed_attempt=%d/%d "
-                            "error_count=%d last_error_type=%s",
-                            resource.value,
-                            check + 1,
-                            self.confirmation_checks,
-                            confirmation_error_count,
-                            last_confirmation_error_type,
-                        )
-                    logger.debug("Fed all eligible monsters with %s", resource.value)
-                    return MonsterLabFeedReport(resource, True, before, last_snapshot)
-            else:
-                consecutive_absences = 0
-
-        raise MonsterLabSubmissionError(
-            f"Unable to confirm Monster Lab {resource.value} feed-all"
-        ) from last_error
+        try:
+            after_state = await wait_for_page_state(
+                self.page,
+                snapshot_expression=_MONSTER_LAB_STATE_SCRIPT,
+                decode=_decode_monster_lab_state,
+                accept=lambda state: state.error_text is not None
+                or (state.has_api and resource not in state.available_feed_all),
+                deadline=deadline,
+                description=f"Monster Lab {resource.value} feed-all result",
+            )
+        except (PageStateTimeout, MonsterLabPageError) as error:
+            raise MonsterLabSubmissionError(
+                f"Unable to confirm Monster Lab {resource.value} feed-all"
+            ) from error
+        if after_state.error_text is not None:
+            message = after_state.error_text.strip() or "feed-all rejected"
+            raise MonsterLabSubmissionError(
+                f"Monster Lab rejected {resource.value} feed-all: {message}"
+            )
+        if not after_state.has_api:
+            raise MonsterLabSubmissionError(
+                f"Unable to confirm Monster Lab {resource.value} feed-all"
+            )
+        after = MonsterLabSnapshot(after_state.available_feed_all)
+        logger.debug("Fed all eligible monsters with %s", resource.value)
+        return MonsterLabFeedReport(resource, True, before, after)
 
     async def _navigate(
         self,
@@ -309,38 +303,27 @@ class MonsterLabClient:
             )
 
     async def _inspect_current(self) -> MonsterLabSnapshot:
+        state = await self._read_state()
+        if not state.has_api:
+            raise MonsterLabPageError("Monster Lab feed-all API is missing")
+        return MonsterLabSnapshot(state.available_feed_all)
+
+    async def _read_state(
+        self,
+        *,
+        deadline: Deadline | None = None,
+    ) -> _MonsterLabPageState:
         try:
-            is_monster_lab = await wait_for_zendriver(
-                self.page.evaluate("typeof do_feed_all === 'function'"),
-                timeout=_READ_TIMEOUT_SECONDS,
-                owner=self.page,
+            return _decode_monster_lab_state(
+                await evaluate_page(
+                    self.page,
+                    _MONSTER_LAB_STATE_SCRIPT,
+                    deadline=deadline,
+                )
             )
         except Exception as error:
-            if is_browser_generation_error(error):
+            if is_browser_generation_error(error) or isinstance(
+                error, MonsterLabPageError
+            ):
                 raise
-            raise MonsterLabPageError(
-                "Unable to inspect Monster Lab feed-all API"
-            ) from error
-        if is_monster_lab is not True:
-            raise MonsterLabPageError("Monster Lab feed-all API is missing")
-
-        available: set[MonsterLabFeed] = set()
-        for resource, action in _FEED_ACTION_NAMES.items():
-            try:
-                elements = await wait_for_zendriver(
-                    self.page.xpath(
-                        f'//img[@src="/y/monster/{action}allmonsters.png"]',
-                        timeout=_SHORT_SELECTOR_INNER_TIMEOUT_SECONDS,
-                    ),
-                    timeout=_SHORT_SELECTOR_OUTER_TIMEOUT_SECONDS,
-                    owner=self.page,
-                )
-            except Exception as error:
-                if is_browser_generation_error(error):
-                    raise
-                raise MonsterLabPageError(
-                    f"Unable to inspect Monster Lab {resource.value} action"
-                ) from error
-            if elements:
-                available.add(resource)
-        return MonsterLabSnapshot(frozenset(available))
+            raise MonsterLabPageError("Unable to inspect Monster Lab state") from error

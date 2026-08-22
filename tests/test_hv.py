@@ -82,7 +82,7 @@ class RealmNavigatorTests(unittest.IsolatedAsyncioTestCase):
         )
 
         with (
-            patch("hvbrowser.realm._CURRENT_URL_TIMEOUT_SECONDS", 0.01),
+            patch("hvbrowser.runtime.PROTOCOL_COMMAND_TIMEOUT_SECONDS", 0.01),
             self.assertRaises(ZendriverOperationTimeout) as raised,
         ):
             await navigator.current()

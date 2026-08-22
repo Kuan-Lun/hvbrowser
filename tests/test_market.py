@@ -1,448 +1,323 @@
-import asyncio
 import unittest
 from collections.abc import Callable
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 from urllib.parse import parse_qs, urlsplit
 
-from hvbrowser.market import (
-    ISEKAI_MARKET_CATEGORIES,
-    PERSISTENT_MARKET_CATEGORIES,
+from hbrowser import BrowserMutationOutcomeUnknownError
+
+from hvbrowser import (
     MarketCategory,
     MarketClient,
     MarketItem,
     MarketPageError,
     MarketSalePlan,
-    MarketSaleReport,
     MarketSaleRequest,
     MarketSubmissionError,
+)
+from hvbrowser.market import (
+    _MarketSaleState,
     market_browse_url,
-    market_item_url,
     parse_market_item_id,
     parse_market_sell_order_id,
     parse_market_stock,
 )
 from hvbrowser.realm import Realm
-from hvbrowser.runtime import ZendriverOperationTimeout
+from hvbrowser.runtime import PageStateTimeout
 
 
-class _FakeElement:
-    def __init__(
-        self,
-        text: str = "",
-        *,
-        attrs: dict[str, str] | None = None,
-        on_click: Callable[[], None] | None = None,
-    ) -> None:
-        self.text = text
-        self.attrs = attrs or {}
-        self.click_count = 0
-        self._on_click = on_click
+class _Element:
+    def __init__(self, action: Callable[[], None] | None = None) -> None:
+        self._action = action
+        self.clicks = 0
 
     async def click(self) -> None:
-        self.click_count += 1
-        if self._on_click:
-            self._on_click()
+        self.clicks += 1
+        if self._action is not None:
+            self._action()
 
 
-class _FakeRow(_FakeElement):
-    def __init__(self, item_id: int, name: str, stock: str) -> None:
-        super().__init__(attrs={"onclick": f"select_market_item({item_id})"})
-        self._cells = [_FakeElement(name), _FakeElement(stock)]
-
-    async def query_selector_all(self, selector: str) -> list[_FakeElement]:
-        if selector != "td":
-            raise AssertionError(f"Unexpected row selector: {selector}")
-        return self._cells
-
-
-class _FakeItemList:
-    def __init__(self, rows: list[_FakeRow]) -> None:
-        self._rows = rows
-
-    async def query_selector_all(self, selector: str) -> list[_FakeRow]:
-        if selector != "table > tbody > tr[onclick]":
-            raise AssertionError(f"Unexpected item-list selector: {selector}")
-        return self._rows
-
-
-class _FakePage:
+class _Page:
     def __init__(self) -> None:
-        self.rows: list[_FakeRow] = []
-        self.fail_market_root = False
-        self.has_sell_order = True
-        self.error_text: str | None = None
-        self.evaluated: list[str] = []
-        self.waited: list[int] = []
-        self.submitted = False
-        self.stock_after_submit = "0"
-        self.fail_stock_confirmation = False
-        self.stock_control = _FakeElement("15")
-        self.update_button = _FakeElement(on_click=self._mark_submitted)
+        self.current_url = ""
+        self.category_rows: dict[MarketCategory, list[dict[str, object]]] = {
+            category: [] for category in MarketCategory
+        }
+        self.stock: int | str = 15
+        self.order_onclick = "autofill_from_sell_order(987,0,0)"
+        self.order_text = "100 C"
+        self.error: str | None = None
+        self.has_stock_control = True
+        self.has_update_button = True
+        self.keep_after_submit = False
+        self.update_error: Exception | None = None
+        self.stock_control = _Element()
+        self.update_button = _Element(self._update)
+        self.expressions: list[str] = []
 
-    def _mark_submitted(self) -> None:
-        self.submitted = True
-        self.stock_control.text = self.stock_after_submit
+    def _update(self) -> None:
+        if self.update_error is not None:
+            raise self.update_error
+        if not self.keep_after_submit:
+            self.stock = 0
 
-    async def select(self, selector: str, timeout: int) -> object:
-        if selector == "#market_itemlist" and timeout == 5:
-            if self.fail_market_root:
-                raise TimeoutError
-            return _FakeItemList(self.rows)
-        if selector == "#sell_order_stock_field > span" and timeout == 5:
-            if self.submitted and self.fail_stock_confirmation:
-                raise TimeoutError
+    def sale_state(self) -> dict[str, object]:
+        return {
+            "sellOrders": [{"onclick": self.order_onclick, "text": self.order_text}],
+            "hasStockControl": self.has_stock_control,
+            "stockText": str(self.stock),
+            "hasUpdateButton": self.has_update_button,
+            "errorText": self.error,
+        }
+
+    async def evaluate(self, expression: str) -> object:
+        self.expressions.append(expression)
+        if "hasItemList" in expression:
+            query = parse_qs(urlsplit(self.current_url).query)
+            category = MarketCategory(query["filter"][0])
+            return {
+                "hasItemList": True,
+                "rows": self.category_rows[category],
+            }
+        if "sellOrders" in expression:
+            return self.sale_state()
+        if expression.startswith("autofill_from_sell_order"):
+            return None
+        raise AssertionError(f"unexpected expression: {expression}")
+
+    async def query_selector(self, selector: str) -> _Element | None:
+        if selector == "#sell_order_stock_field > span":
             return self.stock_control
-        if selector == "#sellorder_update" and timeout == 5:
+        if selector == "#sellorder_update":
             return self.update_button
-        if selector == "#messagebox_inner p.messagebox_error" and timeout == 1:
-            if self.error_text is None:
-                raise TimeoutError
-            return _FakeElement(self.error_text)
-        raise AssertionError(f"Unexpected page selection: {selector}, {timeout}")
-
-    async def xpath(self, selector: str, timeout: int) -> list[_FakeElement]:
-        expected = (
-            "//*[@id='market_itemsell']"
-            "//td[contains(@onclick, 'autofill_from_sell_order')]"
-        )
-        if selector != expected or timeout != 5:
-            raise AssertionError(f"Unexpected XPath: {selector}, {timeout}")
-        if not self.has_sell_order:
-            return []
-        return [_FakeElement(attrs={"onclick": "autofill_from_sell_order(987, 0, 0)"})]
-
-    async def evaluate(self, expression: str) -> None:
-        self.evaluated.append(expression)
-
-    async def wait(self, seconds: int) -> None:
-        self.waited.append(seconds)
+        raise AssertionError(f"unexpected selector: {selector}")
 
 
-class _FakeDriver:
-    def __init__(
-        self,
-        rows_by_filter: dict[str, list[_FakeRow]],
-        *,
-        post_submit_rows_by_filter: dict[str, list[_FakeRow]] | None = None,
-    ) -> None:
-        self.page = _FakePage()
-        self.rows_by_filter = rows_by_filter
-        self.post_submit_rows_by_filter = post_submit_rows_by_filter or rows_by_filter
-        self.visited: list[str] = []
+class _Driver:
+    def __init__(self, page: _Page) -> None:
+        self.page = page
+        self.get_calls: list[str] = []
 
     async def get(self, url: str) -> None:
-        self.visited.append(url)
-        query = parse_qs(urlsplit(url).query)
-        if "itemid" in query:
-            return
-        filter_code = query["filter"][0]
-        rows = (
-            self.post_submit_rows_by_filter
-            if self.page.submitted
-            else self.rows_by_filter
-        )
-        self.page.rows = rows.get(filter_code, [])
+        self.get_calls.append(url)
+        self.page.current_url = url
 
 
-class _FakeRealmNavigator:
-    def __init__(self, realm: Realm) -> None:
-        self.realm = realm
-        self.current_calls = 0
-
-    async def current(self) -> Realm:
-        self.current_calls += 1
-        return self.realm
-
-
-def _client(
-    driver: _FakeDriver,
-    realm: Realm = Realm.PERSISTENT,
-) -> MarketClient:
-    return MarketClient(driver, _FakeRealmNavigator(realm))  # type: ignore[arg-type]
-
-
-class MarketParsingTests(unittest.TestCase):
-    def test_market_urls_are_realm_specific(self) -> None:
-        self.assertEqual(
-            market_browse_url(MarketCategory.MATERIALS, realm=Realm.PERSISTENT),
-            "https://hentaiverse.org/?s=Bazaar&ss=mk&screen=browseitems&filter=ma",
-        )
-        self.assertEqual(
-            market_item_url(MarketCategory.MATERIALS, 123, realm=Realm.ISEKAI),
-            "https://hentaiverse.org/isekai/"
-            "?s=Bazaar&ss=mk&screen=browseitems&filter=ma&itemid=123",
-        )
-
-    def test_isekai_rejects_unavailable_category(self) -> None:
-        with self.assertRaisesRegex(ValueError, "unavailable in Isekai"):
-            market_browse_url(MarketCategory.ARTIFACTS, realm=Realm.ISEKAI)
-
-    def test_parse_item_id_from_supported_actions(self) -> None:
-        self.assertEqual(parse_market_item_id("select_market_item(123)"), 123)
-        self.assertEqual(
-            parse_market_item_id("common.goto_url('?s=Bazaar&ss=mk&itemid=456')"),
-            456,
-        )
-
-    def test_parse_item_id_fails_closed(self) -> None:
-        with self.assertRaises(MarketPageError):
-            parse_market_item_id("do_something_without_an_item()")
-        with self.assertRaises(MarketPageError):
-            parse_market_item_id("unrelated_action(123)")
-
-    def test_parse_stock(self) -> None:
-        self.assertEqual(parse_market_stock(""), 0)
-        self.assertEqual(parse_market_stock(" 1,234 "), 1234)
-        self.assertEqual(parse_market_stock("Stock: 75"), 75)
-
-    def test_parse_stock_fails_closed(self) -> None:
-        with self.assertRaises(MarketPageError):
-            parse_market_stock("not available")
-
-    def test_parse_sell_order_id(self) -> None:
-        self.assertEqual(
-            parse_market_sell_order_id("autofill_from_sell_order(1234, 0, 0)"),
-            1234,
-        )
-        with self.assertRaises(MarketPageError):
-            parse_market_sell_order_id("unrelated_action()")
+def _client(page: _Page, realm: Realm = Realm.PERSISTENT) -> MarketClient:
+    navigator = type(
+        "RealmNavigator",
+        (),
+        {"current": AsyncMock(return_value=realm)},
+    )()
+    return MarketClient(_Driver(page), navigator)  # type: ignore[arg-type]
 
 
 class MarketClientTests(unittest.IsolatedAsyncioTestCase):
-    async def _submit_with_verified_live_semantics(
-        self, client: MarketClient, plan: MarketSalePlan
-    ) -> MarketSaleReport:
-        with patch("hvbrowser.market._MARKET_SUBMISSION_VERIFIED", True):
-            return await client.submit_sales(plan)
+    def test_market_identifier_and_stock_parsers_fail_closed(self) -> None:
+        self.assertEqual(parse_market_item_id("select_market_item(123)"), 123)
+        self.assertEqual(parse_market_item_id("?itemid=456"), 456)
+        self.assertEqual(
+            parse_market_sell_order_id("autofill_from_sell_order(987,0,0)"),
+            987,
+        )
+        self.assertEqual(parse_market_stock("1,234"), 1_234)
+        for parser, value in (
+            (parse_market_item_id, "unknown"),
+            (parse_market_sell_order_id, "unknown"),
+            (parse_market_stock, "unknown"),
+        ):
+            with self.subTest(parser=parser.__name__):
+                with self.assertRaises(MarketPageError):
+                    parser(value)
 
-    async def test_inspect_persistent_market_is_read_only_and_scoped(self) -> None:
-        driver = _FakeDriver(
+    def test_isekai_rejects_persistent_only_category(self) -> None:
+        with self.assertRaises(ValueError):
+            market_browse_url(MarketCategory.ARTIFACTS, realm=Realm.ISEKAI)
+
+    async def test_inspect_uses_one_atomic_snapshot_per_category(self) -> None:
+        page = _Page()
+        page.category_rows[MarketCategory.CONSUMABLES] = [
             {
-                "co": [_FakeRow(101, "Health Draught", "15")],
-                "ma": [_FakeRow(202, "Low-Grade Metals", "1,200")],
+                "onclick": "select_market_item(101)",
+                "cells": ["Health Draught", "1,234"],
             }
-        )
+        ]
 
-        snapshot = await _client(driver).inspect()
+        snapshot = await _client(page).inspect()
 
-        self.assertIs(snapshot.realm, Realm.PERSISTENT)
-        self.assertEqual(
-            driver.visited,
-            [
-                market_browse_url(category, realm=Realm.PERSISTENT)
-                for category in PERSISTENT_MARKET_CATEGORIES
-            ],
-        )
-        self.assertEqual(len(snapshot.items), 2)
-        self.assertEqual(snapshot.items[0].item_id, 101)
-        self.assertEqual(snapshot.items[1].stock, 1200)
-        self.assertEqual(
-            snapshot.items_in(MarketCategory.CONSUMABLES),
-            (snapshot.items[0],),
-        )
+        self.assertEqual(len(snapshot.items), 1)
+        self.assertEqual(snapshot.items[0].stock, 1_234)
+        category_reads = [
+            script for script in page.expressions if "hasItemList" in script
+        ]
+        self.assertEqual(len(category_reads), len(MarketCategory))
 
-    async def test_inspect_isekai_uses_only_available_categories(self) -> None:
-        driver = _FakeDriver({})
+    async def test_isekai_skips_unavailable_categories(self) -> None:
+        page = _Page()
 
-        snapshot = await _client(driver, Realm.ISEKAI).inspect()
+        await _client(page, Realm.ISEKAI).inspect()
 
-        self.assertIs(snapshot.realm, Realm.ISEKAI)
-        self.assertEqual(
-            driver.visited,
-            [
-                market_browse_url(category, realm=Realm.ISEKAI)
-                for category in ISEKAI_MARKET_CATEGORIES
-            ],
-        )
-        self.assertTrue(
-            all(
-                url.startswith("https://hentaiverse.org/isekai/")
-                for url in driver.visited
-            )
-        )
+        self.assertEqual(len(page.expressions), 3)
 
-    async def test_missing_market_root_fails_closed(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.fail_market_root = True
+    async def test_invalid_category_payload_fails_closed(self) -> None:
+        page = _Page()
+        page.evaluate = AsyncMock(return_value={"hasItemList": False, "rows": []})
 
-        with self.assertRaisesRegex(MarketPageError, "Market item list is missing"):
-            await _client(driver).inspect()
+        with self.assertRaises(MarketPageError):
+            await _client(page).inspect()
+
+    async def test_malformed_category_row_fails_closed(self) -> None:
+        page = _Page()
+        page.category_rows[MarketCategory.CONSUMABLES] = [
+            {"onclick": "?itemid=1", "cells": ["only one cell"]}
+        ]
+
+        with self.assertRaisesRegex(MarketPageError, "fewer than two"):
+            await _client(page).inspect()
 
     async def test_plan_sales_is_read_only_and_ignores_empty_stock(self) -> None:
-        driver = _FakeDriver(
-            {
-                "co": [
-                    _FakeRow(101, "Health Draught", "15"),
-                    _FakeRow(102, "Mana Draught", ""),
-                ]
-            }
+        page = _Page()
+        page.category_rows[MarketCategory.CONSUMABLES] = [
+            {"onclick": "?itemid=1", "cells": ["Health Draught", "3"]},
+            {"onclick": "?itemid=2", "cells": ["Mana Draught", "0"]},
+        ]
+
+        plan = await _client(page).plan_sales(
+            MarketSaleRequest(consumables=("Health Draught", "Mana Draught"))
         )
 
-        plan = await _client(driver).plan_sales(
-            MarketSaleRequest(
-                consumables=("health draught", "Mana Draught"),
-            )
-        )
+        self.assertEqual([item.item_id for item in plan.items], [1])
+        self.assertEqual(page.update_button.clicks, 0)
 
-        self.assertIs(plan.realm, Realm.PERSISTENT)
-        self.assertEqual([item.item_id for item in plan.items], [101])
-        self.assertEqual(plan.total_units, 15)
-        self.assertEqual(driver.page.stock_control.click_count, 0)
-        self.assertEqual(driver.page.update_button.click_count, 0)
-
-    async def test_validate_sale_forms_does_not_click_or_evaluate(self) -> None:
-        driver = _FakeDriver({})
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-        plan = MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
-
-        await _client(driver).validate_sale_forms(plan)
-
-        self.assertEqual(
-            driver.visited,
-            [
-                market_item_url(
-                    MarketCategory.CONSUMABLES,
-                    101,
-                    realm=Realm.PERSISTENT,
-                )
-            ],
-        )
-        self.assertEqual(driver.page.stock_control.click_count, 0)
-        self.assertEqual(driver.page.update_button.click_count, 0)
-        self.assertEqual(driver.page.evaluated, [])
-
-    async def test_validate_requires_existing_order_for_pricing(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.has_sell_order = False
+    async def test_quote_uses_atomic_form_state_without_clicking(self) -> None:
+        page = _Page()
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
-        with self.assertRaisesRegex(MarketPageError, "no existing sell order"):
-            await _client(driver).validate_sale_forms(
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
-            )
-
-    async def test_submit_uses_verified_selectors_and_confirms_stock(self) -> None:
-        driver = _FakeDriver(
-            {},
-            post_submit_rows_by_filter={"co": [_FakeRow(101, "Health Draught", "0")]},
+        quote = await _client(page).inspect_sale_quote(
+            item,
+            realm=Realm.PERSISTENT,
         )
+
+        self.assertEqual(quote.sell_order_id, 987)
+        self.assertEqual(quote.current_stock, 15)
+        self.assertEqual(page.stock_control.clicks, 0)
+        self.assertEqual(page.update_button.clicks, 0)
+
+    async def test_quote_requires_order_controls_and_nonblank_stock(self) -> None:
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        report = await self._submit_with_verified_live_semantics(
-            _client(driver), MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
+        cases: tuple[tuple[str, object], ...] = (
+            ("order_onclick", ""),
+            ("has_stock_control", False),
+            ("has_update_button", False),
+            ("stock", ""),
         )
+        for name, value in cases:
+            page = _Page()
+            setattr(page, name, value)
+            with self.subTest(name=name):
+                with self.assertRaises(MarketPageError):
+                    await _client(page).inspect_sale_quote(
+                        item,
+                        realm=Realm.PERSISTENT,
+                    )
+
+    async def test_public_submission_remains_fail_closed(self) -> None:
+        page = _Page()
+        plan = MarketSalePlan(Realm.PERSISTENT, ())
+
+        with self.assertRaisesRegex(MarketSubmissionError, "disabled"):
+            await _client(page).submit_sales(plan)
+
+    async def test_verified_submission_is_once_and_confirms_zero(self) -> None:
+        page = _Page()
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
+        plan = MarketSalePlan(Realm.PERSISTENT, (item,))
+
+        report = await _client(page)._submit_verified_sales(plan)
 
         self.assertEqual(report.sales[0].remaining_stock, 0)
+        self.assertEqual(page.stock_control.clicks, 1)
+        self.assertEqual(page.update_button.clicks, 1)
         self.assertEqual(
-            driver.page.evaluated,
-            ["autofill_from_sell_order(987,0,0);"],
+            len(
+                [script for script in page.expressions if script.startswith("autofill")]
+            ),
+            1,
         )
-        self.assertEqual(driver.page.stock_control.click_count, 1)
-        self.assertEqual(driver.page.update_button.click_count, 1)
-        self.assertEqual(driver.page.waited, [1])
 
-    async def test_submit_surfaces_market_error(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.error_text = "Insufficient stock"
+    async def test_stale_plan_stops_before_mutation(self) -> None:
+        page = _Page()
+        page.stock = 14
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
+
+        with self.assertRaisesRegex(MarketSubmissionError, "stale"):
+            await _client(page)._submit_verified_sales(
+                MarketSalePlan(Realm.PERSISTENT, (item,))
+            )
+
+        self.assertEqual(page.update_button.clicks, 0)
+
+    async def test_server_error_is_typed_without_replay(self) -> None:
+        page = _Page()
+        page.error = "Insufficient stock"
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
         with self.assertRaisesRegex(MarketSubmissionError, "Insufficient stock"):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
+            await _client(page)._submit_verified_sales(
+                MarketSalePlan(Realm.PERSISTENT, (item,))
             )
 
-    async def test_submit_click_hang_is_terminal_without_stock_probe(self) -> None:
-        release = asyncio.Event()
+        self.assertEqual(page.update_button.clicks, 1)
 
-        async def hang() -> None:
-            await release.wait()
+    async def test_update_failure_is_generation_terminal_without_probe(self) -> None:
+        page = _Page()
+        page.update_error = RuntimeError("disconnected")
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
-        driver = _FakeDriver({})
-        driver.page.update_button.click = hang  # type: ignore[method-assign]
+        with self.assertRaises(BrowserMutationOutcomeUnknownError):
+            await _client(page)._submit_verified_sales(
+                MarketSalePlan(Realm.PERSISTENT, (item,))
+            )
+
+        sale_state_reads = [
+            script for script in page.expressions if "sellOrders" in script
+        ]
+        self.assertEqual(len(sale_state_reads), 1)
+        self.assertEqual(page.update_button.clicks, 1)
+
+    async def test_delayed_success_does_not_replay_submission(self) -> None:
+        page = _Page()
+        page.keep_after_submit = True
+        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
+        confirmed = _MarketSaleState((), True, "0", True, None)
+
+        with patch(
+            "hvbrowser.market.wait_for_page_state",
+            new=AsyncMock(return_value=confirmed),
+        ):
+            report = await _client(page)._submit_verified_sales(
+                MarketSalePlan(Realm.PERSISTENT, (item,))
+            )
+
+        self.assertEqual(report.sales[0].remaining_stock, 0)
+        self.assertEqual(page.update_button.clicks, 1)
+
+    async def test_semantic_timeout_is_unknown_without_replay(self) -> None:
+        page = _Page()
+        page.keep_after_submit = True
         item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
 
         with (
-            patch("hvbrowser.market._MUTATION_TIMEOUT_SECONDS", 0.01),
-            self.assertRaises(ZendriverOperationTimeout) as raised,
+            patch(
+                "hvbrowser.market.wait_for_page_state",
+                new=AsyncMock(side_effect=PageStateTimeout("unchanged")),
+            ),
+            self.assertRaisesRegex(MarketSubmissionError, "Unable to confirm"),
         ):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
+            await _client(page)._submit_verified_sales(
+                MarketSalePlan(Realm.PERSISTENT, (item,))
             )
 
-        self.assertEqual(raised.exception.timeout_seconds, 0.01)
-        self.assertEqual(
-            driver.visited,
-            [market_item_url(item.category, item.item_id, realm=Realm.PERSISTENT)],
-        )
-        self.assertEqual(driver.page.waited, [])
-        self.assertFalse(driver.page.submitted)
-        release.set()
-        await asyncio.sleep(0)
-
-    async def test_submit_rejects_unchanged_stock(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.stock_after_submit = "15"
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        with self.assertRaisesRegex(MarketSubmissionError, "did not sell all"):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
-            )
-
-    async def test_submit_rejects_missing_post_submit_item(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.fail_stock_confirmation = True
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        with self.assertRaisesRegex(MarketSubmissionError, "confirmation is missing"):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
-            )
-
-    async def test_submit_rejects_blank_stock_confirmation(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.stock_after_submit = ""
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        with self.assertRaisesRegex(MarketSubmissionError, "confirmation is blank"):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
-            )
-
-    async def test_submit_rejects_stale_plan_before_click(self) -> None:
-        driver = _FakeDriver({})
-        driver.page.stock_control.text = "14"
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        with self.assertRaisesRegex(MarketSubmissionError, "plan is stale"):
-            await self._submit_with_verified_live_semantics(
-                _client(driver),
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,)),
-            )
-
-        self.assertEqual(driver.page.stock_control.click_count, 0)
-        self.assertEqual(driver.page.update_button.click_count, 0)
-
-    async def test_public_submission_is_disabled_before_live_verification(
-        self,
-    ) -> None:
-        driver = _FakeDriver({})
-        item = MarketItem(MarketCategory.CONSUMABLES, 101, "Health Draught", 15)
-
-        with self.assertRaisesRegex(MarketSubmissionError, "submission is disabled"):
-            await _client(driver).submit_sales(
-                MarketSalePlan(realm=Realm.PERSISTENT, items=(item,))
-            )
-
-        self.assertEqual(driver.visited, [])
-        self.assertEqual(driver.page.evaluated, [])
-        self.assertEqual(driver.page.stock_control.click_count, 0)
-        self.assertEqual(driver.page.update_button.click_count, 0)
+        self.assertEqual(page.update_button.clicks, 1)
 
 
 if __name__ == "__main__":

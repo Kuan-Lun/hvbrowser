@@ -11,7 +11,7 @@ authors = [{ name = "Kuan-Lun Wang" }]
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.14,<3.15"
-dependencies = ["hbrowser>=0.41.0,<0.42"]
+dependencies = ["hbrowser>=0.42.0,<0.43"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",

@@ -46,6 +46,29 @@ def _driver(page: object) -> SimpleNamespace:
     )
 
 
+def _lottery_state(
+    *,
+    balance: str | None = "You currently have 1,600,000 GP",
+    tickets: str | None = "You hold 200 tickets",
+) -> dict[str, object]:
+    return {
+        "balanceText": balance,
+        "ticketText": tickets,
+        "hasTicketInput": True,
+        "canSubmit": True,
+        "errorText": None,
+    }
+
+
+def _monster_lab_state(*, has_api: bool) -> dict[str, object]:
+    return {
+        "hasApi": has_api,
+        "foodAvailable": False,
+        "drugsAvailable": False,
+        "errorText": None,
+    }
+
+
 class MaintenanceObservationPriorityTests(unittest.IsolatedAsyncioTestCase):
     async def test_atomic_observation_is_risk_prioritized(self) -> None:
         cases = (
@@ -276,15 +299,17 @@ class MaintenanceTrustRegressionTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_unreadable_page_allows_one_direct_retry(self) -> None:
         route = "https://hentaiverse.org/?s=Bazaar&ss=lt"
+        lottery_states = iter([_lottery_state(balance=None), _lottery_state()])
+
+        async def evaluate(script: str) -> object:
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers(url=route)
+            if "balanceText" in script and "ticketText" in script:
+                return next(lottery_states)
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
         page = SimpleNamespace(
-            evaluate=AsyncMock(return_value=_markers(url=route)),
-            xpath=AsyncMock(
-                side_effect=[
-                    [],
-                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
-                    [SimpleNamespace(text="You hold 200 tickets")],
-                ]
-            ),
+            evaluate=AsyncMock(side_effect=evaluate),
         )
         driver = _driver(page)
 
@@ -490,15 +515,17 @@ class MaintenanceTrustContractTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_read_failure_allows_one_direct_reload(self) -> None:
         route = "https://hentaiverse.org/?s=Bazaar&ss=lt"
+        lottery_states = iter([_lottery_state(balance=None), _lottery_state()])
+
+        async def evaluate(script: str) -> object:
+            if "nextFloor" in script and "battle_main" in script:
+                return _markers(url=route)
+            if "balanceText" in script and "ticketText" in script:
+                return next(lottery_states)
+            raise AssertionError(f"Unexpected evaluate script: {script!r}")
+
         page = SimpleNamespace(
-            evaluate=AsyncMock(return_value=_markers(url=route)),
-            xpath=AsyncMock(
-                side_effect=[
-                    [],
-                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
-                    [SimpleNamespace(text="You hold 200 tickets")],
-                ]
-            ),
+            evaluate=AsyncMock(side_effect=evaluate),
         )
         driver = _driver(page)
 
@@ -621,23 +648,21 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         driver.wait.assert_not_awaited()
 
     async def test_lottery_correct_route_reloads_once_after_read_error(self) -> None:
+        states = iter([_lottery_state(balance=None), _lottery_state()])
+
         async def evaluate(script: str) -> object:
             if script == "window.location.href":
                 return "https://hentaiverse.org/?s=Bazaar&ss=lt"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=lt")
+            if "balanceText" in script and "ticketText" in script:
+                return next(states)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
             evaluate=AsyncMock(side_effect=evaluate),
             select=AsyncMock(),
-            xpath=AsyncMock(
-                side_effect=[
-                    [],
-                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
-                    [SimpleNamespace(text="You hold 200 tickets")],
-                ]
-            ),
+            xpath=AsyncMock(),
         )
         driver = _driver(page)
 
@@ -666,12 +691,14 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return "https://hentaiverse.org/?s=Bazaar&ss=la"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=la")
+            if "balanceText" in script and "ticketText" in script:
+                return _lottery_state(balance=None)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
             evaluate=AsyncMock(side_effect=evaluate),
             select=AsyncMock(),
-            xpath=AsyncMock(side_effect=[[], []]),
+            xpath=AsyncMock(),
         )
         driver = _driver(page)
 
@@ -682,7 +709,12 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
             )
 
         self.assertEqual(driver.get.await_count, 2)
-        self.assertEqual(page.xpath.await_count, 2)
+        state_reads = [
+            call
+            for call in page.evaluate.await_args_list
+            if "balanceText" in call.args[0]
+        ]
+        self.assertEqual(len(state_reads), 2)
 
     async def test_lottery_direct_navigation_rejects_wrong_realm(self) -> None:
         marker_results = iter(
@@ -865,6 +897,8 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return next(api_results)
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=ml")
+            if "foodAvailable" in script and "drugsAvailable" in script:
+                return _monster_lab_state(has_api=next(api_results))
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
@@ -891,6 +925,8 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return False
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=ml")
+            if "foodAvailable" in script and "drugsAvailable" in script:
+                return _monster_lab_state(has_api=False)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
@@ -917,6 +953,8 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return False
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=ml")
+            if "foodAvailable" in script and "drugsAvailable" in script:
+                return _monster_lab_state(has_api=False)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
@@ -940,7 +978,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         api_checks = [
             call
             for call in page.evaluate.await_args_list
-            if call.args == ("typeof do_feed_all === 'function'",)
+            if "foodAvailable" in call.args[0]
         ]
         self.assertEqual(len(api_checks), 2)
         self.assertEqual(len(captured.output), 1)
@@ -1053,17 +1091,14 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return "https://hentaiverse.org/?s=Bazaar&ss=la"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=la")
+            if "balanceText" in script and "ticketText" in script:
+                return _lottery_state(tickets="You hold 100 tickets")
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(
             evaluate=AsyncMock(side_effect=evaluate),
             select=AsyncMock(side_effect=selection_error),
-            xpath=AsyncMock(
-                side_effect=[
-                    [SimpleNamespace(text="You currently have 1,600,000 GP")],
-                    [SimpleNamespace(text="You hold 100 tickets")],
-                ]
-            ),
+            xpath=AsyncMock(),
         )
         driver = _driver(page)
 

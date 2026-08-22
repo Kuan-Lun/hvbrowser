@@ -10,7 +10,7 @@ from .maintenance_navigation import MaintenanceNavigationContext
 from .market import MarketCategory, MarketPageError
 from .monster_lab import MonsterLabFeed
 from .realm import Realm
-from .runtime import wait_for_zendriver
+from .runtime import evaluate_page
 from .session import HentaiVerseSession
 
 
@@ -18,9 +18,9 @@ class LiveProbeRefused(RuntimeError):
     """A live probe was stopped before browser construction."""
 
 
-_ACTIVE_BATTLE_XPATH = "//*[@id='battle_main' or @id='riddlesubmit' or @id='btcp']"
-_BATTLE_MARKER_INNER_TIMEOUT_SECONDS = 2.0
-_BATTLE_MARKER_OUTER_TIMEOUT_SECONDS = 4.0
+_ACTIVE_BATTLE_SCRIPT = (
+    'Boolean(document.querySelector("#battle_main, #riddlesubmit, #btcp"))'
+)
 
 
 @dataclass(frozen=True)
@@ -91,15 +91,11 @@ async def run_live_probe(
     create_session = session_factory or (lambda: HentaiVerseSession(headless=True))
 
     async with create_session() as session:
-        battle_markers = await wait_for_zendriver(
-            session.browser.page.xpath(
-                _ACTIVE_BATTLE_XPATH,
-                timeout=_BATTLE_MARKER_INNER_TIMEOUT_SECONDS,
-            ),
-            timeout=_BATTLE_MARKER_OUTER_TIMEOUT_SECONDS,
-            owner=session.browser.page,
+        active_battle = await evaluate_page(
+            session.browser.page,
+            _ACTIVE_BATTLE_SCRIPT,
         )
-        if battle_markers:
+        if active_battle is not False:
             raise LiveProbeRefused(
                 "An active battle was detected; the read-only probe stopped"
             )
