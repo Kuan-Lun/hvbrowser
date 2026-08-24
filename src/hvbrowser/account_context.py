@@ -35,7 +35,7 @@ from .hv import HVDriver
 from .realm import Realm, RealmDetectionError, realm_from_url
 from .runtime import (
     PROTOCOL_COMMAND_TIMEOUT_SECONDS,
-    BrowserOwnershipDeadline,
+    BrowserOperationDeadline,
     is_browser_generation_error,
     log_context,
     wait_for_zendriver,
@@ -650,7 +650,7 @@ class HentaiVerseAccountContext[BrowserT, TabT]:
             # Bind every deadline field before task creation so eager task
             # factories cannot start owner cleanup against incomplete state.
             task = asyncio.create_task(
-                self._owner.close(deadline=BrowserOwnershipDeadline(deadline_at))
+                self._owner.close(deadline=BrowserOperationDeadline(deadline_at))
             )
             task.add_done_callback(self._observe_close_task)
             self._close_task = task

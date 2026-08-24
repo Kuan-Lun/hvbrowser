@@ -207,5 +207,40 @@ class RawDriverBoundaryTests(unittest.TestCase):
             self.assertFalse(hasattr(driver, domain_operation))
 
 
+class BudgetedNavigationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_translates_remaining_budget_to_hbrowser_deadline(self) -> None:
+        driver = HVDriver(headless=True)
+        driver.myget = AsyncMock()
+
+        await driver.navigate_with_budget(
+            "https://hentaiverse.org/?s=Battle&ss=ar",
+            budget_seconds=6.0,
+        )
+
+        driver.myget.assert_awaited_once()
+        call = driver.myget.await_args
+        self.assertEqual(
+            call.args,
+            ("https://hentaiverse.org/?s=Battle&ss=ar",),
+        )
+        deadline = call.kwargs["deadline"]
+        self.assertTrue(hasattr(deadline, "bounded"))
+        self.assertTrue(hasattr(deadline, "expired"))
+        self.assertGreater(deadline.remaining(), 0)
+        self.assertLessEqual(deadline.remaining(), 6.0)
+
+    async def test_expired_budget_never_dispatches_navigation(self) -> None:
+        driver = HVDriver(headless=True)
+        driver.myget = AsyncMock()
+
+        with self.assertRaisesRegex(TimeoutError, "expired before dispatch"):
+            await driver.navigate_with_budget(
+                "https://hentaiverse.org/?s=Battle&ss=ar",
+                budget_seconds=0,
+            )
+
+        driver.myget.assert_not_awaited()
+
+
 if __name__ == "__main__":
     unittest.main()

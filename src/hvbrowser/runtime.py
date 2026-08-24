@@ -23,9 +23,7 @@ from hbrowser.gallery.browser.process import (
     start_owned_process,
 )
 from hbrowser.gallery.element_action import ElementAction
-from hbrowser.gallery.utils import (
-    Deadline as BrowserOwnershipDeadline,
-)
+from hbrowser.gallery.utils import Deadline as BrowserOperationDeadline
 from hbrowser.gallery.utils import (
     LogPersistenceError,
     ZendriverOperationTimeout,
@@ -385,7 +383,7 @@ def json_expression(value: object) -> str:
 
 
 __all__ = [
-    "BrowserOwnershipDeadline",
+    "BrowserOperationDeadline",
     "ElementAction",
     "Deadline",
     "LOCAL_DOM_STATE_TIMEOUT_SECONDS",
