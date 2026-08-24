@@ -1,6 +1,7 @@
 """Typed, explicit Monster Lab feed-all browser operations."""
 
 import json
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
@@ -21,12 +22,11 @@ from .runtime import (
     evaluate_page,
     invoke_mutation,
     is_browser_generation_error,
-    setup_logger,
     wait_for_page_state,
 )
 from .urls import HENTAIVERSE_ROOT_URL
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class MonsterLabFeed(StrEnum):

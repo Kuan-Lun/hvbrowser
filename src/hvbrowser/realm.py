@@ -1,13 +1,14 @@
 """Typed HentaiVerse realm inspection and navigation."""
 
+import logging
 from enum import StrEnum
 from typing import Any, Protocol
 from urllib.parse import urlsplit
 
-from .runtime import evaluate_page, setup_logger
+from .runtime import evaluate_page
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 
 class Realm(StrEnum):

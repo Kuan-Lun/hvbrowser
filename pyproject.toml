@@ -4,14 +4,14 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hvbrowser"
-version = "0.9.4"
+version = "0.9.5"
 description = "Browser automation APIs for HentaiVerse."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
 license = "AGPL-3.0-or-later"
 license-files = ["LICENSE"]
 requires-python = ">=3.14,<3.15"
-dependencies = ["hbrowser>=0.42.4,<0.43"]
+dependencies = ["hbrowser>=0.42.5,<0.43"]
 
 classifiers = [
     "Development Status :: 3 - Alpha",

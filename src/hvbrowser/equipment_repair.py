@@ -1,5 +1,6 @@
 """Typed inspection and repair operations for equipped gear."""
 
+import logging
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Protocol, cast
@@ -20,12 +21,11 @@ from .runtime import (
     invoke_mutation,
     is_browser_generation_error,
     query_page,
-    setup_logger,
     wait_for_page_state,
 )
 from .urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _EQUIPMENT_STATE_SCRIPT = """
 (() => {

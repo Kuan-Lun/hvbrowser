@@ -1,5 +1,6 @@
 """Typed character-state inspection and stamina recovery operations."""
 
+import logging
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -14,11 +15,10 @@ from .runtime import (
     invoke_mutation,
     is_browser_generation_error,
     query_page,
-    setup_logger,
     wait_for_page_state,
 )
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 _LEVEL_PATTERN = re.compile(r"(?:^|\s)Lv\.\s*([0-9]+)\s*$")
 _STAMINA_PATTERN = re.compile(r"Stamina:\s*([0-9]+)")

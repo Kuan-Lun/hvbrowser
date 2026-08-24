@@ -27,6 +27,8 @@ from hbrowser.gallery.utils import Deadline as BrowserOperationDeadline
 from hbrowser.gallery.utils import (
     LogPersistenceError,
     ZendriverOperationTimeout,
+    close_forwarded_logging,
+    configure_forwarded_logging,
     is_browser_generation_error,
     log_context,
     setup_logger,
@@ -394,6 +396,8 @@ __all__ = [
     "ProcessOwnershipError",
     "SERVER_STATE_RECEIPT_TIMEOUT_SECONDS",
     "ZendriverOperationTimeout",
+    "close_forwarded_logging",
+    "configure_forwarded_logging",
     "evaluate_page",
     "invoke_mutation",
     "is_browser_generation_error",

@@ -1,5 +1,6 @@
 """Typed, explicit Weapon/Armor Lottery browser operations."""
 
+import logging
 import re
 from dataclasses import dataclass
 from enum import StrEnum
@@ -23,12 +24,11 @@ from .runtime import (
     invoke_mutation,
     is_browser_generation_error,
     query_page,
-    setup_logger,
     wait_for_page_state,
 )
 from .urls import HENTAIVERSE_ROOT_URL
 
-logger = setup_logger(__name__)
+logger = logging.getLogger(__name__)
 
 LOTTERY_TICKET_PRICE_GP = 1_000
 
