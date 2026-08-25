@@ -31,7 +31,6 @@ from hbrowser.gallery.utils import (
     configure_forwarded_logging,
     is_browser_generation_error,
     log_context,
-    setup_logger,
     wait_for_zendriver,
 )
 from hbrowser.gallery.utils.mutation import wait_for_zendriver_mutation
@@ -405,7 +404,6 @@ __all__ = [
     "log_context",
     "notify",
     "query_page",
-    "setup_logger",
     "start_owned_process",
     "wait_for_page_state",
     "wait_for_zendriver",

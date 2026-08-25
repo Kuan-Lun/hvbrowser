@@ -38,6 +38,9 @@ class RuntimeBoundaryTests(unittest.TestCase):
         )
         self.assertIs(wait_for_zendriver, hbrowser_wait_for_zendriver)
 
+    def test_runtime_does_not_export_blanket_connection_error_classifier(self) -> None:
+        self.assertFalse(hasattr(runtime, "is_connection_error"))
+
 
 class _EventPage:
     def __init__(self) -> None:
