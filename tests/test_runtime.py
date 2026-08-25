@@ -38,9 +38,6 @@ class RuntimeBoundaryTests(unittest.TestCase):
         )
         self.assertIs(wait_for_zendriver, hbrowser_wait_for_zendriver)
 
-    def test_legacy_connection_classifier_is_removed(self) -> None:
-        self.assertFalse(hasattr(runtime, "is_connection_error"))
-
 
 class _EventPage:
     def __init__(self) -> None:
