@@ -1,8 +1,11 @@
 import asyncio
+import re
 import unittest
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import AsyncMock, patch
+
+from hbrowser import BrowserMutationOutcomeUnknownError
 
 from hvbrowser import (
     PlayerClient,
@@ -42,19 +45,42 @@ class _Page:
         self.error: str | None = None
         self.on_submit: Callable[[], None] = lambda: setattr(self, "stamina", 95)
         self.stamina_element = _Element()
-        self.restorative = _Element(lambda: self.on_submit())
+        self.restorative = _Element()
         self.error_element = _Element()
         self.expressions: list[str] = []
+        self.submissions = 0
+        self.submission_evaluations = 0
+        self.recovery_form_valid = True
+        self.stamina_after_initial_snapshot: int | None = None
 
     async def evaluate(self, expression: str) -> dict[str, object]:
         self.expressions.append(expression)
-        return {
+        if "hvbrowser:submit-stamina-restorative" in expression:
+            self.submission_evaluations += 1
+            expected_match = re.search(r"const expectedStamina = ([0-9]+);", expression)
+            if expected_match is None:
+                raise AssertionError("submission script did not embed expected stamina")
+            if self.stamina != int(expected_match.group(1)):
+                return {"status": "state-changed"}
+            if not self.restorative_available:
+                return {"status": "not-available"}
+            if not self.recovery_form_valid:
+                return {"status": "invalid-controls"}
+            self.submissions += 1
+            self.on_submit()
+            return {"status": "submitted"}
+
+        snapshot = {
             "levelText": f"Lv. {self.level}",
             "staminaText": f"Stamina: {self.stamina}",
             "hasStaminaReadout": True,
             "restorativeAvailable": self.restorative_available,
             "errorText": self.error,
         }
+        if self.stamina_after_initial_snapshot is not None:
+            self.stamina = self.stamina_after_initial_snapshot
+            self.stamina_after_initial_snapshot = None
+        return snapshot
 
     async def query_selector(self, selector: str) -> Any:
         if selector == "#stamina_readout":
@@ -113,7 +139,7 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(PlayerStateChangedError):
             await _client(page).recover_stamina(expected_before=80)
 
-        self.assertEqual(page.restorative.clicks, 0)
+        self.assertEqual(page.submissions, 0)
 
     async def test_unavailable_restorative_is_known_without_click(self) -> None:
         page = _Page()
@@ -123,7 +149,31 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(report.outcome, StaminaRecoveryOutcome.NOT_AVAILABLE)
         self.assertEqual(report.after, 80)
-        self.assertEqual(page.restorative.clicks, 0)
+        self.assertEqual(page.submission_evaluations, 0)
+        self.assertEqual(page.submissions, 0)
+
+    async def test_atomic_submission_rechecks_stamina_without_mutation(self) -> None:
+        page = _Page(stamina=80)
+        page.stamina_after_initial_snapshot = 81
+        state_wait = AsyncMock()
+
+        with (
+            patch("hvbrowser.player.wait_for_page_state", new=state_wait),
+            self.assertRaises(PlayerStateChangedError),
+        ):
+            await _client(page).recover_stamina(expected_before=80)
+
+        self.assertEqual(page.submissions, 0)
+        state_wait.assert_not_awaited()
+
+    async def test_invalid_hidden_form_fails_closed_without_submission(self) -> None:
+        page = _Page()
+        page.recovery_form_valid = False
+
+        with self.assertRaisesRegex(PlayerPageError, "controls are invalid"):
+            await _client(page).recover_stamina()
+
+        self.assertEqual(page.submissions, 0)
 
     async def test_recovery_confirms_state_change_without_fixed_sleep(self) -> None:
         page = _Page(stamina=80)
@@ -132,7 +182,10 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIs(report.outcome, StaminaRecoveryOutcome.RECOVERED)
         self.assertEqual(report.after, 95)
-        self.assertEqual(page.restorative.clicks, 1)
+        self.assertEqual(page.submissions, 1)
+        self.assertEqual(page.stamina_element.moves, 0)
+        self.assertEqual(page.restorative.moves, 0)
+        self.assertEqual(page.restorative.clicks, 0)
 
     async def test_server_rejection_is_a_typed_known_outcome(self) -> None:
         page = _Page()
@@ -166,7 +219,7 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
             report = await _client(page).recover_stamina()
 
         self.assertIs(report.outcome, StaminaRecoveryOutcome.RECOVERED)
-        self.assertEqual(page.restorative.clicks, 1)
+        self.assertEqual(page.submissions, 1)
 
     async def test_semantic_timeout_is_not_a_protocol_timeout(self) -> None:
         page = _Page()
@@ -181,16 +234,20 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
         ):
             await _client(page).recover_stamina()
 
-        self.assertEqual(page.restorative.clicks, 1)
+        self.assertEqual(page.submissions, 1)
 
     async def test_submission_hang_is_terminal_without_state_probe(self) -> None:
         page = _Page()
         release = asyncio.Event()
 
-        async def hang() -> None:
-            await release.wait()
+        original_evaluate = page.evaluate
 
-        page.restorative.mouse_click = AsyncMock(side_effect=hang)  # type: ignore[method-assign]
+        async def hang_submission(expression: str) -> dict[str, object]:
+            if "hvbrowser:submit-stamina-restorative" in expression:
+                await release.wait()
+            return await original_evaluate(expression)
+
+        page.evaluate = AsyncMock(side_effect=hang_submission)
         state_wait = AsyncMock()
         with (
             patch("hvbrowser.runtime.PROTOCOL_COMMAND_TIMEOUT_SECONDS", 0.01),
@@ -200,8 +257,52 @@ class PlayerClientTests(unittest.IsolatedAsyncioTestCase):
             await _client(page).recover_stamina()
 
         state_wait.assert_not_awaited()
+        self.assertEqual(page.submissions, 0)
         release.set()
         await asyncio.sleep(0)
+
+    async def test_lost_acknowledgement_after_submit_is_never_replayed(self) -> None:
+        page = _Page()
+        original_evaluate = page.evaluate
+
+        async def lose_acknowledgement(expression: str) -> dict[str, object]:
+            if "hvbrowser:submit-stamina-restorative" in expression:
+                page.submissions += 1
+                page.on_submit()
+                raise RuntimeError("execution context destroyed")
+            return await original_evaluate(expression)
+
+        page.evaluate = AsyncMock(side_effect=lose_acknowledgement)
+        state_wait = AsyncMock()
+        with (
+            patch("hvbrowser.player.wait_for_page_state", new=state_wait),
+            self.assertRaises(BrowserMutationOutcomeUnknownError),
+        ):
+            await _client(page).recover_stamina()
+
+        self.assertEqual(page.submissions, 1)
+        state_wait.assert_not_awaited()
+
+    async def test_unknown_submission_payload_is_terminal_without_replay(self) -> None:
+        page = _Page()
+        original_evaluate = page.evaluate
+
+        async def unknown_payload(expression: str) -> dict[str, object]:
+            if "hvbrowser:submit-stamina-restorative" in expression:
+                page.submissions += 1
+                return {"status": "unknown"}
+            return await original_evaluate(expression)
+
+        page.evaluate = AsyncMock(side_effect=unknown_payload)
+        state_wait = AsyncMock()
+        with (
+            patch("hvbrowser.player.wait_for_page_state", new=state_wait),
+            self.assertRaisesRegex(StaminaRecoveryError, "outcome is unknown"),
+        ):
+            await _client(page).recover_stamina()
+
+        self.assertEqual(page.submissions, 1)
+        state_wait.assert_not_awaited()
 
 
 if __name__ == "__main__":

@@ -1,5 +1,6 @@
 """Typed character-state inspection and stamina recovery operations."""
 
+import json
 import logging
 import re
 from dataclasses import dataclass
@@ -7,7 +8,6 @@ from enum import StrEnum
 from typing import Any, Protocol, cast
 
 from .runtime import (
-    LOCAL_DOM_STATE_TIMEOUT_SECONDS,
     SERVER_STATE_RECEIPT_TIMEOUT_SECONDS,
     Deadline,
     PageStateTimeout,
@@ -25,6 +25,7 @@ _STAMINA_PATTERN = re.compile(r"Stamina:\s*([0-9]+)")
 _RESTORATIVE_SELECTOR = (
     "img[onclick=\"document.getElementById('recoverform').submit()\"]"
 )
+_RESTORATIVE_SELECTOR_JSON = json.dumps(_RESTORATIVE_SELECTOR)
 _RECOVERY_ERROR_SELECTOR = "p.messagebox_error"
 _PLAYER_STATE_SCRIPT = r"""
 (() => {
@@ -44,6 +45,61 @@ _PLAYER_STATE_SCRIPT = r"""
         errorText: error ? error.textContent : null,
     };
 })()
+"""
+
+
+def _stamina_recovery_submission_script(expected_stamina: int) -> str:
+    return f"""
+/* hvbrowser:submit-stamina-restorative */
+(() => {{
+    const expectedStamina = {expected_stamina};
+    const readout = document.getElementById("stamina_readout");
+    const match = readout
+        ? (readout.textContent || "").match(/Stamina:\\s*([0-9]+)/)
+        : null;
+    if (!match) return {{status: "invalid-controls"}};
+
+    const currentStamina = Number.parseInt(match[1], 10);
+    if (!Number.isSafeInteger(currentStamina)) {{
+        return {{status: "invalid-controls"}};
+    }}
+    if (currentStamina !== expectedStamina) {{
+        return {{status: "state-changed"}};
+    }}
+
+    const restorative = document.querySelector({_RESTORATIVE_SELECTOR_JSON});
+    if (!restorative) return {{status: "not-available"}};
+
+    const form = document.getElementById("recoverform");
+    const isForm = typeof HTMLFormElement !== "undefined"
+        && form instanceof HTMLFormElement;
+    const method = isForm
+        ? (form.getAttribute("method") || "").trim().toLowerCase()
+        : "";
+    const action = isForm ? form.getAttribute("action") : null;
+    const inputs = isForm
+        ? form.querySelectorAll('input[name="recover"]')
+        : [];
+    const input = inputs.length === 1 ? inputs[0] : null;
+    if (
+        !isForm
+        || !form.isConnected
+        || method !== "post"
+        || (action !== null && action.trim() !== "")
+        || typeof form.submit !== "function"
+        || restorative.closest("form") !== form
+        || !input
+        || input.type !== "hidden"
+        || input.value !== "stamina"
+        || input.disabled
+        || input.form !== form
+    ) {{
+        return {{status: "invalid-controls"}};
+    }}
+
+    form.submit();
+    return {{status: "submitted"}};
+}})()
 """
 
 
@@ -84,6 +140,13 @@ class _PlayerPageState:
     has_stamina_readout: bool
     restorative_available: bool
     error_text: str | None
+
+
+class _StaminaRecoverySubmissionStatus(StrEnum):
+    SUBMITTED = "submitted"
+    STATE_CHANGED = "state-changed"
+    NOT_AVAILABLE = "not-available"
+    INVALID_CONTROLS = "invalid-controls"
 
 
 class PlayerPageError(RuntimeError):
@@ -146,6 +209,20 @@ def _parse_stamina(state: _PlayerPageState) -> int:
     if match is None:
         raise PlayerPageError(f"Unable to parse stamina from: {text!r}")
     return int(match.group(1))
+
+
+def _decode_stamina_recovery_submission(
+    raw: object,
+) -> _StaminaRecoverySubmissionStatus:
+    if not isinstance(raw, dict):
+        raise StaminaRecoveryError("Stamina recovery outcome is unknown")
+    status = cast(dict[object, object], raw).get("status")
+    if not isinstance(status, str):
+        raise StaminaRecoveryError("Stamina recovery outcome is unknown")
+    try:
+        return _StaminaRecoverySubmissionStatus(status)
+    except ValueError as error:
+        raise StaminaRecoveryError("Stamina recovery outcome is unknown") from error
 
 
 class PlayerClient:
@@ -216,56 +293,18 @@ class PlayerClient:
             )
         if not initial.has_stamina_readout:
             raise PlayerPageError("Unable to find stamina recovery controls")
-
-        preparation_deadline = Deadline.after(LOCAL_DOM_STATE_TIMEOUT_SECONDS)
-        logger.debug("Checking USR RESTORATIVE availability for stamina recovery")
-        stamina_readout = await query_page(
-            self.page,
-            "#stamina_readout",
-            deadline=preparation_deadline,
-        )
-        if stamina_readout is None:
-            raise PlayerPageError("Unable to find stamina recovery controls")
-        try:
-            await invoke_mutation(
-                stamina_readout.mouse_move,
-                owner=stamina_readout,
-                operation="Stamina recovery control hover",
-                deadline=preparation_deadline,
-            )
-        except Exception as error:
-            if is_browser_generation_error(error):
-                raise
-            raise PlayerPageError(
-                "Unable to inspect stamina restorative availability"
-            ) from error
-
-        hovered = await self._read_state(deadline=preparation_deadline)
-        if not hovered.restorative_available:
+        if not initial.restorative_available:
             return StaminaRecoveryReport(
                 StaminaRecoveryOutcome.NOT_AVAILABLE,
                 before,
                 before,
             )
-        restorative = await query_page(
-            self.page,
-            _RESTORATIVE_SELECTOR,
-            deadline=preparation_deadline,
-        )
-        if restorative is None:
-            raise PlayerPageError("Stamina restorative control disappeared")
 
         receipt_deadline = Deadline.after(SERVER_STATE_RECEIPT_TIMEOUT_SECONDS)
         try:
-            await invoke_mutation(
-                restorative.mouse_move,
-                owner=restorative,
-                operation="Stamina restorative hover",
-                deadline=receipt_deadline,
-            )
-            await invoke_mutation(
-                restorative.mouse_click,
-                owner=restorative,
+            raw_submission = await invoke_mutation(
+                lambda: self.page.evaluate(_stamina_recovery_submission_script(before)),
+                owner=self.page,
                 operation="Stamina restorative submission",
                 deadline=receipt_deadline,
             )
@@ -273,6 +312,20 @@ class PlayerClient:
             if is_browser_generation_error(error):
                 raise
             raise StaminaRecoveryError("Stamina recovery outcome is unknown") from error
+
+        submission = _decode_stamina_recovery_submission(raw_submission)
+        if submission is _StaminaRecoverySubmissionStatus.STATE_CHANGED:
+            raise PlayerStateChangedError(
+                "Stamina changed before recovery; inspect and decide again"
+            )
+        if submission is _StaminaRecoverySubmissionStatus.NOT_AVAILABLE:
+            return StaminaRecoveryReport(
+                StaminaRecoveryOutcome.NOT_AVAILABLE,
+                before,
+                before,
+            )
+        if submission is _StaminaRecoverySubmissionStatus.INVALID_CONTROLS:
+            raise PlayerPageError("Stamina recovery controls are invalid")
 
         try:
             after_state = await wait_for_page_state(
