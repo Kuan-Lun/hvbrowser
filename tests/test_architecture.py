@@ -1,4 +1,5 @@
 import ast
+import tomllib
 import unittest
 from pathlib import Path
 
@@ -103,6 +104,17 @@ def _number(node: ast.expr | None, constants: dict[str, float]) -> float | None:
 
 
 class ArchitectureTests(unittest.TestCase):
+    def test_direct_zendriver_import_has_a_direct_dependency(self) -> None:
+        project_file = Path(__file__).parents[1] / "pyproject.toml"
+        project = tomllib.loads(project_file.read_text(encoding="utf-8"))["project"]
+
+        self.assertTrue(
+            any(
+                dependency.startswith("zendriver")
+                for dependency in project["dependencies"]
+            )
+        )
+
     def test_server_mutations_use_a_receipt_budget_separate_from_command_cap(
         self,
     ) -> None:
@@ -342,17 +354,17 @@ class ArchitectureTests(unittest.TestCase):
                         violations.append(
                             f"{source_file.name}:{node.lineno}: watchdog is not awaited"
                         )
-                    if (
-                        owner is None
-                        or isinstance(owner, ast.Constant)
-                        and owner.value is None
+                    if owner is None or (
+                        isinstance(owner, ast.Constant) and owner.value is None
                     ):
                         violations.append(
-                            f"{source_file.name}:{node.lineno}: watchdog owner is missing"
+                            f"{source_file.name}:{node.lineno}: "
+                            "watchdog owner is missing"
                         )
                     if timeout is None:
                         violations.append(
-                            f"{source_file.name}:{node.lineno}: watchdog timeout is missing"
+                            f"{source_file.name}:{node.lineno}: "
+                            "watchdog timeout is missing"
                         )
                     else:
                         resolved_timeout = _number(timeout, constants)
@@ -365,7 +377,8 @@ class ArchitectureTests(unittest.TestCase):
                             )
                     if not node.args:
                         violations.append(
-                            f"{source_file.name}:{node.lineno}: watchdog awaitable is missing"
+                            f"{source_file.name}:{node.lineno}: "
+                            "watchdog awaitable is missing"
                         )
                         continue
 
@@ -411,9 +424,11 @@ class ArchitectureTests(unittest.TestCase):
 
                 if isinstance(node.func, ast.Attribute) and (
                     node.func.attr in {"select", "xpath"}
-                    or node.func.attr == "wait"
-                    and _attribute_parts(node.func.value)[-1:]
-                    in {("page",), ("driver",), ("_driver",)}
+                    or (
+                        node.func.attr == "wait"
+                        and _attribute_parts(node.func.value)[-1:]
+                        in {("page",), ("driver",), ("_driver",)}
+                    )
                 ):
                     violations.append(
                         f"{source_file.name}:{node.lineno}: polling/fixed wait "

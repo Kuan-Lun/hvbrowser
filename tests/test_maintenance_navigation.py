@@ -776,9 +776,12 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(blocker=blocker):
                 marker_results = iter([_markers(), marker_payload])
 
-                async def evaluate(script: str) -> object:
+                async def evaluate(
+                    script: str,
+                    results=marker_results,
+                ) -> object:
                     if "nextFloor" in script and "battle_main" in script:
-                        return next(marker_results)
+                        return next(results)
                     raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
                 page = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))
@@ -1010,9 +1013,12 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(current_url=current_url):
                 marker_results = iter([_markers(), _markers(url=current_url)])
 
-                async def evaluate(script: str) -> object:
+                async def evaluate(
+                    script: str,
+                    results=marker_results,
+                ) -> object:
                     if "nextFloor" in script and "battle_main" in script:
-                        return next(marker_results)
+                        return next(results)
                     raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
                 page = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))
@@ -1067,9 +1073,12 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                     ]
                 )
 
-                async def evaluate(script: str) -> object:
+                async def evaluate(
+                    script: str,
+                    results=marker_results,
+                ) -> object:
                     if "nextFloor" in script and "battle_main" in script:
-                        return next(marker_results)
+                        return next(results)
                     raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
                 page = SimpleNamespace(evaluate=AsyncMock(side_effect=evaluate))

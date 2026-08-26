@@ -185,3 +185,7 @@ uv pip install --python .venv/bin/python --reinstall --no-deps --editable \
 ```
 
 Commands that must preserve the editable overlay use `uv run --no-sync`.
+
+## License
+
+This project is licensed under GPL-3.0-only. See [LICENSE](LICENSE).

@@ -52,15 +52,15 @@ class _RecordingLogContext:
     """Test double with the nesting semantics of hbrowser.log_context."""
 
     def __init__(self) -> None:
-        self._active: ContextVar[dict[str, str]] = ContextVar(
+        self._active: ContextVar[dict[str, str] | None] = ContextVar(
             "test_log_context",
-            default={},
+            default=None,
         )
         self.entered: list[dict[str, str]] = []
 
     @property
     def current(self) -> dict[str, str]:
-        return dict(self._active.get())
+        return dict(self._active.get() or {})
 
     @contextmanager
     def __call__(
