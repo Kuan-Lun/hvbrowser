@@ -181,7 +181,7 @@ For coordinated local development, overlay the local checkout after rebuilding:
 
 ```bash
 uv pip install --python .venv/bin/python --reinstall --no-deps --editable \
-  /Users/kuanlun_wang/Desktop/git-repo/hbrowser.clone
+  /path/to/hbrowser
 ```
 
 Commands that must preserve the editable overlay use `uv run --no-sync`.
