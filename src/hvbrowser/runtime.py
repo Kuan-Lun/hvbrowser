@@ -181,7 +181,8 @@ class _DomChangeHub:
         try:
             _require_timely_result(deadline, "DOM change observer setup")
             if self._ready:
-                return
+                # Another setup coroutine may finish while this task awaits the lock.
+                return  # type: ignore[unreachable]
             await self._install(deadline)
             _require_timely_result(deadline, "DOM change observer setup")
         finally:
@@ -384,16 +385,16 @@ def json_expression(value: object) -> str:
 
 
 __all__ = [
-    "BrowserOperationDeadline",
-    "ElementAction",
-    "Deadline",
     "LOCAL_DOM_STATE_TIMEOUT_SECONDS",
+    "PROTOCOL_COMMAND_TIMEOUT_SECONDS",
+    "SERVER_STATE_RECEIPT_TIMEOUT_SECONDS",
+    "BrowserOperationDeadline",
+    "Deadline",
+    "ElementAction",
     "LogPersistenceError",
     "OwnedProcess",
-    "PROTOCOL_COMMAND_TIMEOUT_SECONDS",
     "PageStateTimeout",
     "ProcessOwnershipError",
-    "SERVER_STATE_RECEIPT_TIMEOUT_SECONDS",
     "ZendriverOperationTimeout",
     "close_forwarded_logging",
     "configure_forwarded_logging",

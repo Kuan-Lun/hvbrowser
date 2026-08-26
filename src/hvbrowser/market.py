@@ -1,6 +1,7 @@
 import re
 from dataclasses import dataclass
 from enum import StrEnum
+from functools import partial
 from typing import Any, Protocol, cast
 
 from .realm import Realm, RealmNavigator
@@ -395,11 +396,13 @@ class MarketClient:
                     f"Market sale plan is stale for {item.name!r}: "
                     f"planned={item.stock}, current={sale_form.current_stock}"
                 )
+            sell_order_id = sale_form.sell_order_id
             deadline = Deadline.after(SERVER_STATE_RECEIPT_TIMEOUT_SECONDS)
             try:
                 await invoke_mutation(
-                    lambda: self._driver.page.evaluate(
-                        "autofill_from_sell_order(" f"{sale_form.sell_order_id},0,0);"
+                    partial(
+                        self._driver.page.evaluate,
+                        f"autofill_from_sell_order({sell_order_id},0,0);",
                     ),
                     owner=self._driver.page,
                     operation=f"Market autofill for {item.name}",
@@ -428,8 +431,10 @@ class MarketClient:
                     self._driver.page,
                     snapshot_expression=_MARKET_SALE_STATE_SCRIPT,
                     decode=_decode_market_sale_state,
-                    accept=lambda current: current.error_text is not None
-                    or self._sale_state_stock_is_zero(current),
+                    accept=lambda current: (
+                        current.error_text is not None
+                        or self._sale_state_stock_is_zero(current)
+                    ),
                     deadline=deadline,
                     description=f"Market sale result for {item.name}",
                 )

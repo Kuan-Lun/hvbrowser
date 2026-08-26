@@ -73,10 +73,10 @@ _EQUIPMENT_STATE_SCRIPT = """
 """
 _ARMORY_URLS = {
     Realm.PERSISTENT: (
-        f"{HENTAIVERSE_ROOT_URL}/" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
+        f"{HENTAIVERSE_ROOT_URL}/?s=Bazaar&ss=am&screen=repair&filter=equipped"
     ),
     Realm.ISEKAI: (
-        f"{HENTAIVERSE_ISEKAI_ROOT_URL}" "?s=Bazaar&ss=am&screen=repair&filter=equipped"
+        f"{HENTAIVERSE_ISEKAI_ROOT_URL}?s=Bazaar&ss=am&screen=repair&filter=equipped"
     ),
 }
 
@@ -317,8 +317,9 @@ class EquipmentRepairClient:
                 self.page,
                 snapshot_expression=_EQUIPMENT_STATE_SCRIPT,
                 decode=_decode_equipment_state,
-                accept=lambda current: current.error_text is not None
-                or self._repair_count(current) == 0,
+                accept=lambda current: (
+                    current.error_text is not None or self._repair_count(current) == 0
+                ),
                 deadline=submission_deadline,
                 description="equipment repair completion",
             )
@@ -530,14 +531,16 @@ class EquipmentRepairClient:
                 self.page,
                 snapshot_expression=_EQUIPMENT_STATE_SCRIPT,
                 decode=_decode_equipment_state,
-                accept=lambda current: current.has_submit
-                and current.repair_selected
-                and current.equipped_selected
-                and current.has_equip_form
-                and current.has_equip_list
-                and current.submit_disabled is not None
-                and current.selectable_count is not None
-                and current.selected_count == current.selectable_count,
+                accept=lambda current: (
+                    current.has_submit
+                    and current.repair_selected
+                    and current.equipped_selected
+                    and current.has_equip_form
+                    and current.has_equip_list
+                    and current.submit_disabled is not None
+                    and current.selectable_count is not None
+                    and current.selected_count == current.selectable_count
+                ),
                 deadline=deadline,
                 description="equipment select-all state",
             )

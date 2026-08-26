@@ -190,8 +190,10 @@ class MonsterLabClient:
                 self.page,
                 snapshot_expression=_MONSTER_LAB_STATE_SCRIPT,
                 decode=_decode_monster_lab_state,
-                accept=lambda state: state.error_text is not None
-                or (state.has_api and resource not in state.available_feed_all),
+                accept=lambda state: (
+                    state.error_text is not None
+                    or (state.has_api and resource not in state.available_feed_all)
+                ),
                 deadline=deadline,
                 description=f"Monster Lab {resource.value} feed-all result",
             )

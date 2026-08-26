@@ -332,8 +332,13 @@ class PlayerClient:
                 self.page,
                 snapshot_expression=_PLAYER_STATE_SCRIPT,
                 decode=_decode_player_state,
-                accept=lambda state: state.error_text is not None
-                or (state.stamina_text is not None and _parse_stamina(state) > before),
+                accept=lambda state: (
+                    state.error_text is not None
+                    or (
+                        state.stamina_text is not None
+                        and _parse_stamina(state) > before
+                    )
+                ),
                 deadline=receipt_deadline,
                 description="stamina recovery result",
             )

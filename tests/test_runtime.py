@@ -301,7 +301,7 @@ class RuntimeStateWaitTests(unittest.IsolatedAsyncioTestCase):
         await page.emit_dom_change()
 
         self.assertEqual(await waiter, 1)
-        hub = getattr(page, "_hvbrowser_dom_change_hub")
+        hub = page._hvbrowser_dom_change_hub
         self.assertEqual(hub._waiters, {})
 
     async def test_concurrent_waiters_share_one_handler_subscription(self) -> None:
@@ -322,7 +322,7 @@ class RuntimeStateWaitTests(unittest.IsolatedAsyncioTestCase):
         ]
         while not hasattr(page, "_hvbrowser_dom_change_hub"):
             await asyncio.sleep(0)
-        while len(getattr(page, "_hvbrowser_dom_change_hub")._waiters) < 2:
+        while len(page._hvbrowser_dom_change_hub._waiters) < 2:
             await asyncio.sleep(0)
         page.state = 1
         await page.emit_dom_change()
@@ -383,7 +383,7 @@ class RuntimeStateWaitTests(unittest.IsolatedAsyncioTestCase):
                 description="state one",
             )
 
-        hub = getattr(page, "_hvbrowser_dom_change_hub")
+        hub = page._hvbrowser_dom_change_hub
         self.assertEqual(hub._waiters, {})
 
     async def test_subscription_failure_registers_no_local_handler(self) -> None:

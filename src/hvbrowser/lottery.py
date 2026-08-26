@@ -229,7 +229,8 @@ class LotteryClient:
             form_state = await self._read_state(deadline=preparation_deadline)
             if self._snapshot(kind, form_state) != before:
                 raise LotteryStateChangedError(
-                    f"{kind.value} state changed before purchase; inspect and plan again"
+                    f"{kind.value} state changed before purchase; "
+                    "inspect and plan again"
                 )
             if not form_state.has_ticket_input:
                 raise LotteryPageError("Lottery ticket input is missing")
@@ -282,8 +283,10 @@ class LotteryClient:
                 self.page,
                 snapshot_expression=_LOTTERY_STATE_SCRIPT,
                 decode=_decode_lottery_state,
-                accept=lambda state: state.error_text is not None
-                or self._matches(state, expected_gp, expected_tickets),
+                accept=lambda state: (
+                    state.error_text is not None
+                    or self._matches(state, expected_gp, expected_tickets)
+                ),
                 deadline=receipt_deadline,
                 description=f"{kind.value} purchase result",
             )
