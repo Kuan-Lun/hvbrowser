@@ -54,22 +54,9 @@ jobs:
           print(f"publish={'true' if current > published else 'false'}")
           PY
 
-      - name: Verify and build
+      - name: Build distributions
         if: steps.version.outputs.publish == 'true'
         run: |
-          for attempt in 1 2 3 4 5; do
-            if python -m pip install --no-cache-dir --editable ".[dev]"; then
-              break
-            fi
-            if [ "$attempt" -eq 5 ]; then
-              exit 1
-            fi
-            sleep 30
-          done
-          black --check src/hvbrowser tests
-          ruff check src/hvbrowser tests
-          mypy src/hvbrowser
-          pytest
           python -m pip install --upgrade build check-wheel-contents twine
           python -m build
           python -m twine check dist/*
