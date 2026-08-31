@@ -50,10 +50,12 @@ def _lottery_state(
     *,
     balance: str | None = "You currently have 1,600,000 GP",
     tickets: str | None = "You hold 200 tickets",
+    price: str | None = "Each ticket costs 1,000 GP",
 ) -> dict[str, object]:
     return {
-        "balanceText": balance,
-        "ticketText": tickets,
+        "pageText": "\n".join(
+            text for text in (balance, tickets, price) if text is not None
+        ),
         "hasTicketInput": True,
         "canSubmit": True,
         "errorText": None,
@@ -304,7 +306,7 @@ class MaintenanceTrustRegressionTests(unittest.IsolatedAsyncioTestCase):
         async def evaluate(script: str) -> object:
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url=route)
-            if "balanceText" in script and "ticketText" in script:
+            if "hvbrowser-lottery-state-v2" in script:
                 return next(lottery_states)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
@@ -520,7 +522,7 @@ class MaintenanceTrustContractTests(unittest.IsolatedAsyncioTestCase):
         async def evaluate(script: str) -> object:
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url=route)
-            if "balanceText" in script and "ticketText" in script:
+            if "hvbrowser-lottery-state-v2" in script:
                 return next(lottery_states)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
@@ -655,7 +657,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return "https://hentaiverse.org/?s=Bazaar&ss=lt"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=lt")
-            if "balanceText" in script and "ticketText" in script:
+            if "hvbrowser-lottery-state-v2" in script:
                 return next(states)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
@@ -691,7 +693,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return "https://hentaiverse.org/?s=Bazaar&ss=la"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=la")
-            if "balanceText" in script and "ticketText" in script:
+            if "hvbrowser-lottery-state-v2" in script:
                 return _lottery_state(balance=None)
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
@@ -712,7 +714,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
         state_reads = [
             call
             for call in page.evaluate.await_args_list
-            if "balanceText" in call.args[0]
+            if "hvbrowser-lottery-state-v2" in call.args[0]
         ]
         self.assertEqual(len(state_reads), 2)
 
@@ -1100,7 +1102,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 return "https://hentaiverse.org/?s=Bazaar&ss=la"
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=la")
-            if "balanceText" in script and "ticketText" in script:
+            if "hvbrowser-lottery-state-v2" in script:
                 return _lottery_state(tickets="You hold 100 tickets")
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 

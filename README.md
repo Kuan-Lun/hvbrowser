@@ -70,6 +70,13 @@ Lottery inspection returns the current ticket count, shared GP balance, and
 fixed ticket price. Purchasing requires an explicit kind and positive quantity,
 then verifies the exact ticket increase and GP decrease.
 
+The page reader takes one atomic visible-text snapshot and requires exactly one
+complete label for the ticket count, GP balance, and ticket price. Missing,
+malformed, duplicate, or unsupported-price fields fail closed. `inspect()` may
+perform its documented one-time direct reload after an unreadable landing;
+`inspect_once()` performs no recovery navigation and is intended for tightly
+bounded read-only probes.
+
 ```python
 from hvbrowser import LotteryKind, MaintenanceNavigationContext
 
@@ -152,9 +159,10 @@ re-lists unrelated orders.
 ## Guarded live smoke test
 
 The surrounding application owns account selection. The smoke probe requires
-credentials through environment indirection, stops on active battle markers,
-and performs no purchase, feed-all, Market submission, repair, recovery, or
-battle action:
+credentials through environment indirection, verifies the first Persistent
+landing before any feature navigation, stops on challenge, completion,
+next-floor, or active-battle markers, and performs no purchase, feed-all,
+Market submission, repair, recovery, or battle action:
 
 ```bash
 uv run --no-sync python scripts/live_readonly_smoke.py \
@@ -168,8 +176,8 @@ realms.
 
 ## Development
 
-HVBrowser 0.9 requires `hbrowser>=0.42.5,<0.43`; earlier compatibility lines are
-not supported.
+HVBrowser 0.10 requires the authentication-only `Driver.login()` contract from
+`hbrowser>=0.44.0,<0.45`; earlier compatibility lines are not supported.
 
 Build a clean environment backed by the PyPI release of `hbrowser`:
 

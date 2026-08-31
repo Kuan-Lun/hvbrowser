@@ -1,7 +1,10 @@
 import ast
 import tomllib
 import unittest
+from importlib.metadata import requires
 from pathlib import Path
+
+from packaging.requirements import Requirement
 
 from hvbrowser import (
     HENTAIVERSE_ISEKAI_ROOT_URL,
@@ -113,6 +116,34 @@ class ArchitectureTests(unittest.TestCase):
                 dependency.startswith("zendriver")
                 for dependency in project["dependencies"]
             )
+        )
+
+    def test_direct_zendriver_dependency_matches_hbrowser_cohort(self) -> None:
+        project_file = Path(__file__).parents[1] / "pyproject.toml"
+        project = tomllib.loads(project_file.read_text(encoding="utf-8"))["project"]
+        direct_dependencies = [
+            Requirement(dependency) for dependency in project["dependencies"]
+        ]
+        hbrowser_dependencies = [
+            Requirement(dependency) for dependency in requires("hbrowser") or ()
+        ]
+
+        direct_zendriver = [
+            dependency
+            for dependency in direct_dependencies
+            if dependency.name == "zendriver"
+        ]
+        hbrowser_zendriver = [
+            dependency
+            for dependency in hbrowser_dependencies
+            if dependency.name == "zendriver"
+        ]
+
+        self.assertEqual(len(direct_zendriver), 1)
+        self.assertEqual(len(hbrowser_zendriver), 1)
+        self.assertEqual(
+            direct_zendriver[0].specifier,
+            hbrowser_zendriver[0].specifier,
         )
 
     def test_server_mutations_use_a_receipt_budget_separate_from_command_cap(

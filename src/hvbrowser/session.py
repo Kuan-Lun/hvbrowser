@@ -12,6 +12,7 @@ from .player import PlayerClient
 from .realm import Realm, RealmNavigator
 
 BrowserReadyHook = Callable[[], Awaitable[None]]
+PersistentReadyHook = Callable[[], Awaitable[None]]
 
 
 class HentaiVerseSession:
@@ -43,8 +44,9 @@ class HentaiVerseSession:
         self,
         *,
         on_browser_ready: BrowserReadyHook | None = None,
+        on_persistent_ready: PersistentReadyHook | None = None,
     ) -> Self:
-        """Initialize, optionally configure, authenticate, and enter Persistent."""
+        """Initialize, authenticate, enter Persistent once, and run safety checks."""
         if self._started:
             raise RuntimeError("HentaiVerse session is already started")
         try:
@@ -53,6 +55,8 @@ class HentaiVerseSession:
                 await on_browser_ready()
             await self.browser.login()
             await self.realm.go_home(Realm.PERSISTENT)
+            if on_persistent_ready is not None:
+                await on_persistent_ready()
         except BaseException as error:
             await self.browser.__aexit__(type(error), error, error.__traceback__)
             raise

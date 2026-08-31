@@ -34,23 +34,31 @@ LOTTERY_TICKET_PRICE_GP = 1_000
 
 _LOTTERY_STATE_SCRIPT = r"""
 (() => {
-    const nodes = Array.from(document.querySelectorAll("body *"));
-    const balance = nodes.find((node) =>
-        (node.textContent || "").includes("You currently have")
-    );
-    const tickets = nodes.find((node) =>
-        (node.textContent || "").includes("You hold")
-    );
+    // hvbrowser-lottery-state-v2
+    const pageText = document.body ? document.body.innerText : null;
     const error = document.querySelector("p.messagebox_error");
     return {
-        balanceText: balance ? balance.textContent : null,
-        ticketText: tickets ? tickets.textContent : null,
+        pageText,
         hasTicketInput: Boolean(document.getElementById("ticket_temp")),
         canSubmit: typeof submit_buy === "function",
-        errorText: error ? error.textContent : null,
+        errorText: error ? error.innerText : null,
     };
 })()
 """
+
+_LOTTERY_AMOUNT_PATTERN = r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)"
+_LOTTERY_TICKET_COUNT_LABEL = re.compile(r"You\s+hold\b")
+_LOTTERY_TICKET_COUNT = re.compile(
+    rf"You\s+hold\s+(?P<amount>{_LOTTERY_AMOUNT_PATTERN})\s+tickets?\b"
+)
+_LOTTERY_GP_BALANCE_LABEL = re.compile(r"You\s+currently\s+have\b")
+_LOTTERY_GP_BALANCE = re.compile(
+    rf"You\s+currently\s+have\s+(?P<amount>{_LOTTERY_AMOUNT_PATTERN})\s+GP\b"
+)
+_LOTTERY_TICKET_PRICE_LABEL = re.compile(r"Each\s+ticket\s+costs\b")
+_LOTTERY_TICKET_PRICE = re.compile(
+    rf"Each\s+ticket\s+costs\s+(?P<amount>{_LOTTERY_AMOUNT_PATTERN})\s+GP\b"
+)
 
 
 class LotteryKind(StrEnum):
@@ -111,44 +119,79 @@ class _LotteryDriver(Protocol):
 
 @dataclass(frozen=True, slots=True)
 class _LotteryPageState:
-    balance_text: str | None
-    ticket_text: str | None
+    page_text: str | None
     has_ticket_input: bool
     can_submit: bool
     error_text: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class _LotteryAmounts:
+    gp_balance: int
+    tickets: int
+    ticket_price_gp: int
 
 
 def _decode_lottery_state(raw: object) -> _LotteryPageState:
     if not isinstance(raw, dict):
         raise LotteryPageError("Lottery state payload is invalid")
     payload = cast(dict[object, object], raw)
-    balance_text = payload.get("balanceText")
-    ticket_text = payload.get("ticketText")
+    page_text = payload.get("pageText")
     has_ticket_input = payload.get("hasTicketInput")
     can_submit = payload.get("canSubmit")
     error_text = payload.get("errorText")
     if (
-        (balance_text is not None and not isinstance(balance_text, str))
-        or (ticket_text is not None and not isinstance(ticket_text, str))
+        (page_text is not None and not isinstance(page_text, str))
         or type(has_ticket_input) is not bool
         or type(can_submit) is not bool
         or (error_text is not None and not isinstance(error_text, str))
     ):
         raise LotteryPageError("Lottery state payload is invalid")
     return _LotteryPageState(
-        balance_text,
-        ticket_text,
+        page_text,
         has_ticket_input,
         can_submit,
         error_text,
     )
 
 
-def _parse_first_integer(text: str, *, field: str) -> int:
-    match = re.search(r"\d[\d,]*", text)
-    if match is None:
-        raise LotteryPageError(f"Unable to parse {field} from Lottery page")
-    return int(match.group(0).replace(",", ""))
+def _parse_unique_lottery_amount(
+    page_text: str,
+    *,
+    label_pattern: re.Pattern[str],
+    value_pattern: re.Pattern[str],
+    field: str,
+) -> int:
+    label_count = sum(1 for _ in label_pattern.finditer(page_text))
+    matches = tuple(value_pattern.finditer(page_text))
+    if label_count != 1 or len(matches) != 1:
+        raise LotteryPageError(f"Lottery {field} is missing, malformed, or ambiguous")
+    return int(matches[0].group("amount").replace(",", ""))
+
+
+def _parse_lottery_amounts(page_text: str) -> _LotteryAmounts:
+    normalized = page_text.replace("\N{NO-BREAK SPACE}", " ")
+    tickets = _parse_unique_lottery_amount(
+        normalized,
+        label_pattern=_LOTTERY_TICKET_COUNT_LABEL,
+        value_pattern=_LOTTERY_TICKET_COUNT,
+        field="ticket count",
+    )
+    gp_balance = _parse_unique_lottery_amount(
+        normalized,
+        label_pattern=_LOTTERY_GP_BALANCE_LABEL,
+        value_pattern=_LOTTERY_GP_BALANCE,
+        field="GP balance",
+    )
+    ticket_price_gp = _parse_unique_lottery_amount(
+        normalized,
+        label_pattern=_LOTTERY_TICKET_PRICE_LABEL,
+        value_pattern=_LOTTERY_TICKET_PRICE,
+        field="ticket price",
+    )
+    if ticket_price_gp != LOTTERY_TICKET_PRICE_GP:
+        raise LotteryPageError("Lottery ticket price is unsupported")
+    return _LotteryAmounts(gp_balance, tickets, ticket_price_gp)
 
 
 class LotteryClient:
@@ -168,13 +211,8 @@ class LotteryClient:
         context: MaintenanceNavigationContext,
     ) -> LotterySnapshot:
         """Navigate to and inspect one lottery without purchasing tickets."""
-        if not isinstance(kind, LotteryKind):
-            raise TypeError("kind must be a LotteryKind")
-        if not isinstance(context, MaintenanceNavigationContext):
-            raise TypeError("context must be a MaintenanceNavigationContext")
-        await self._navigate(kind, context=context)
         try:
-            return await self._inspect_current(kind)
+            return await self.inspect_once(kind, context=context)
         except LotteryPageError as error:
             logger.warning(
                 "Lottery page was not readable after navigation; "
@@ -188,6 +226,20 @@ class LotteryClient:
             kind,
             context=MaintenanceNavigationContext.ORDINARY,
         )
+        return await self._inspect_current(kind)
+
+    async def inspect_once(
+        self,
+        kind: LotteryKind,
+        *,
+        context: MaintenanceNavigationContext,
+    ) -> LotterySnapshot:
+        """Navigate and inspect exactly once for fail-closed probe composition."""
+        if not isinstance(kind, LotteryKind):
+            raise TypeError("kind must be a LotteryKind")
+        if not isinstance(context, MaintenanceNavigationContext):
+            raise TypeError("context must be a MaintenanceNavigationContext")
+        await self._navigate(kind, context=context)
         return await self._inspect_current(kind)
 
     async def purchase(
@@ -430,20 +482,14 @@ class LotteryClient:
 
     @staticmethod
     def _snapshot(kind: LotteryKind, state: _LotteryPageState) -> LotterySnapshot:
-        if state.balance_text is None:
-            raise LotteryPageError("Lottery GP balance is missing")
-        if state.ticket_text is None:
-            raise LotteryPageError("Lottery ticket count is missing")
+        if state.page_text is None:
+            raise LotteryPageError("Lottery page text is missing")
+        amounts = _parse_lottery_amounts(state.page_text)
         return LotterySnapshot(
             kind=kind,
-            gp_balance=_parse_first_integer(
-                state.balance_text,
-                field="GP balance",
-            ),
-            tickets=_parse_first_integer(
-                state.ticket_text,
-                field="ticket count",
-            ),
+            gp_balance=amounts.gp_balance,
+            tickets=amounts.tickets,
+            ticket_price_gp=amounts.ticket_price_gp,
         )
 
     @staticmethod

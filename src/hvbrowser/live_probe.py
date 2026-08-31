@@ -2,25 +2,25 @@
 
 import os
 from collections import Counter
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
+from contextlib import AsyncExitStack, asynccontextmanager
 from dataclasses import dataclass
+from urllib.parse import urlsplit
 
-from .lottery import LotteryKind
-from .maintenance_navigation import MaintenanceNavigationContext
+from .lottery import LotteryKind, LotterySnapshot
+from .maintenance_navigation import (
+    MaintenanceNavigationContext,
+    observe_maintenance_navigation,
+)
 from .market import MarketCategory, MarketPageError
 from .monster_lab import MonsterLabFeed
 from .realm import Realm
-from .runtime import evaluate_page
+from .runtime import is_browser_generation_error
 from .session import HentaiVerseSession
 
 
 class LiveProbeRefused(RuntimeError):
-    """A live probe was stopped before browser construction."""
-
-
-_ACTIVE_BATTLE_SCRIPT = (
-    'Boolean(document.querySelector("#battle_main, #riddlesubmit, #btcp"))'
-)
+    """A live probe was stopped by a fail-closed safety check."""
 
 
 @dataclass(frozen=True)
@@ -75,6 +75,76 @@ def validate_live_environment(
         )
 
 
+def _summarize_lottery(snapshot: LotterySnapshot) -> LotterySummary:
+    return LotterySummary(
+        snapshot.kind,
+        snapshot.tickets,
+        snapshot.gp_balance,
+        snapshot.ticket_price_gp,
+    )
+
+
+async def _inspect_lotteries(
+    session: HentaiVerseSession,
+) -> tuple[LotterySummary, ...]:
+    summaries: list[LotterySummary] = []
+    for kind in LotteryKind:
+        snapshot = await session.lottery.inspect_once(
+            kind,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
+        summaries.append(_summarize_lottery(snapshot))
+    return tuple(summaries)
+
+
+async def _require_safe_persistent_probe_page(session: HentaiVerseSession) -> None:
+    try:
+        observation = await observe_maintenance_navigation(session.browser.page)
+    except Exception as error:
+        if is_browser_generation_error(error):
+            raise
+        raise LiveProbeRefused(
+            "Unable to verify the page before the read-only probe"
+        ) from error
+    if (
+        observation.realm is not Realm.PERSISTENT
+        or urlsplit(observation.url).path != "/"
+    ):
+        raise LiveProbeRefused(
+            "The read-only probe requires a trusted Persistent realm page"
+        )
+    if observation.blocker is not None:
+        raise LiveProbeRefused(
+            "A battle state was detected; the read-only probe stopped"
+        )
+
+
+@asynccontextmanager
+async def _safe_persistent_probe_session(
+    session_factory: Callable[[], HentaiVerseSession],
+) -> AsyncIterator[HentaiVerseSession]:
+    session = session_factory()
+    async with AsyncExitStack() as stack:
+        await session.start(
+            on_persistent_ready=lambda: _require_safe_persistent_probe_page(session)
+        )
+        stack.push_async_exit(session)
+        yield session
+
+
+async def run_lottery_readonly_probe(
+    *,
+    session_factory: Callable[[], HentaiVerseSession] | None = None,
+    environment: Mapping[str, str] | None = None,
+) -> tuple[LotterySummary, ...]:
+    """Inspect both Persistent lotteries once from a trusted non-battle page."""
+    validate_live_environment(environment)
+    create_session = session_factory or (lambda: HentaiVerseSession(headless=True))
+
+    async with _safe_persistent_probe_session(create_session) as session:
+        return await _inspect_lotteries(session)
+
+
 async def run_live_probe(
     *,
     inspect_market: bool = True,
@@ -90,36 +160,13 @@ async def run_live_probe(
     validate_live_environment(environment)
     create_session = session_factory or (lambda: HentaiVerseSession(headless=True))
 
-    async with create_session() as session:
-        active_battle = await evaluate_page(
-            session.browser.page,
-            _ACTIVE_BATTLE_SCRIPT,
-        )
-        if active_battle is not False:
-            raise LiveProbeRefused(
-                "An active battle was detected; the read-only probe stopped"
-            )
-
+    async with _safe_persistent_probe_session(create_session) as session:
         stamina = await session.player.read_stamina()
         realm = await session.realm.current()
 
         lottery_summaries: tuple[LotterySummary, ...] = ()
         if inspect_lotteries and realm is Realm.PERSISTENT:
-            lottery_summaries = tuple(
-                LotterySummary(
-                    kind=snapshot.kind,
-                    tickets=snapshot.tickets,
-                    gp_balance=snapshot.gp_balance,
-                    ticket_price_gp=snapshot.ticket_price_gp,
-                )
-                for snapshot in [
-                    await session.lottery.inspect(
-                        kind,
-                        context=MaintenanceNavigationContext.ORDINARY,
-                    )
-                    for kind in LotteryKind
-                ]
-            )
+            lottery_summaries = await _inspect_lotteries(session)
 
         monster_lab_summary: MonsterLabSummary | None = None
         if inspect_monster_lab and realm is Realm.PERSISTENT:

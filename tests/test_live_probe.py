@@ -1,13 +1,14 @@
 import ast
 import unittest
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import AsyncMock, Mock
+from unittest.mock import AsyncMock, Mock, patch
 
 from hvbrowser.live_probe import (
-    _ACTIVE_BATTLE_SCRIPT,
     LiveProbeRefused,
     run_live_probe,
+    run_lottery_readonly_probe,
 )
 from hvbrowser.lottery import LotteryKind, LotterySnapshot
 from hvbrowser.maintenance_navigation import MaintenanceNavigationContext
@@ -19,6 +20,7 @@ from hvbrowser.market import (
 )
 from hvbrowser.monster_lab import MonsterLabFeed, MonsterLabSnapshot
 from hvbrowser.realm import Realm
+from hvbrowser.runtime import ZendriverOperationTimeout
 
 _CREDENTIAL_ENV = {
     "EH_USERNAME": "provided-indirectly",
@@ -29,11 +31,18 @@ _CREDENTIAL_ENV = {
 class _FakePage:
     def __init__(self, *, in_battle: bool = False) -> None:
         self.in_battle = in_battle
+        self.observation_payload: object = {
+            "url": "https://hentaiverse.org/",
+            "challenge": False,
+            "completion": False,
+            "nextFloor": False,
+            "active": in_battle,
+        }
 
-    async def evaluate(self, script: str) -> bool:
-        if script != _ACTIVE_BATTLE_SCRIPT:
-            raise AssertionError(f"Unexpected battle check: {script}")
-        return self.in_battle
+    async def evaluate(self, script: str) -> object:
+        if "nextFloor" in script and "battle_main" in script:
+            return self.observation_payload
+        raise AssertionError(f"Unexpected battle check: {script}")
 
 
 class _FakeSession:
@@ -50,9 +59,27 @@ class _FakeSession:
             inspect=AsyncMock(),
             inspect_sale_quote=AsyncMock(),
         )
-        self.lottery = SimpleNamespace(inspect=AsyncMock())
+        self.lottery = SimpleNamespace(
+            inspect=AsyncMock(),
+            inspect_once=AsyncMock(),
+        )
         self.monster_lab = SimpleNamespace(inspect=AsyncMock())
         self.exited = False
+        self.home_calls = 0
+
+    async def start(
+        self,
+        *,
+        on_persistent_ready: Callable[[], Awaitable[None]] | None = None,
+    ) -> _FakeSession:
+        self.home_calls += 1
+        try:
+            if on_persistent_ready is not None:
+                await on_persistent_ready()
+        except BaseException:
+            self.exited = True
+            raise
+        return self
 
     async def __aenter__(self) -> _FakeSession:
         return self
@@ -62,6 +89,164 @@ class _FakeSession:
 
 
 class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
+    async def test_lottery_probe_credential_guard_precedes_session(self) -> None:
+        factory = Mock()
+
+        with self.assertRaisesRegex(LiveProbeRefused, "EH_USERNAME"):
+            await run_lottery_readonly_probe(
+                session_factory=factory,
+                environment={},
+            )
+
+        factory.assert_not_called()
+
+    async def test_lottery_probe_only_inspects_both_lotteries_once(self) -> None:
+        session = _FakeSession()
+        session.lottery.inspect_once.side_effect = [
+            LotterySnapshot(LotteryKind.WEAPON, 8_077_830, 87),
+            LotterySnapshot(LotteryKind.ARMOR, 8_077_830, 46),
+        ]
+
+        result = await run_lottery_readonly_probe(
+            session_factory=lambda: session,
+            environment=_CREDENTIAL_ENV,
+        )
+
+        self.assertEqual(
+            [(summary.kind, summary.tickets) for summary in result],
+            [(LotteryKind.WEAPON, 87), (LotteryKind.ARMOR, 46)],
+        )
+        self.assertTrue(all(summary.gp_balance == 8_077_830 for summary in result))
+        self.assertEqual(
+            session.lottery.inspect_once.await_args_list,
+            [
+                unittest.mock.call(
+                    LotteryKind.WEAPON,
+                    context=MaintenanceNavigationContext.ORDINARY,
+                ),
+                unittest.mock.call(
+                    LotteryKind.ARMOR,
+                    context=MaintenanceNavigationContext.ORDINARY,
+                ),
+            ],
+        )
+        session.player.read_stamina.assert_not_awaited()
+        session.realm.current.assert_not_awaited()
+        session.market.inspect.assert_not_awaited()
+        session.market.inspect_sale_quote.assert_not_awaited()
+        session.monster_lab.inspect.assert_not_awaited()
+        session.lottery.inspect.assert_not_awaited()
+        self.assertEqual(session.home_calls, 1)
+        self.assertTrue(session.exited)
+
+    async def test_lottery_probe_refuses_every_battle_marker_before_inspect(
+        self,
+    ) -> None:
+        marker_names = ("challenge", "completion", "nextFloor", "active")
+        for marker_name in marker_names:
+            with self.subTest(marker=marker_name):
+                session = _FakeSession()
+                session.browser.page.observation_payload = {
+                    "url": "https://hentaiverse.org/",
+                    "challenge": marker_name == "challenge",
+                    "completion": marker_name == "completion",
+                    "nextFloor": marker_name == "nextFloor",
+                    "active": marker_name == "active",
+                }
+
+                with self.assertRaisesRegex(LiveProbeRefused, "battle state"):
+                    await run_lottery_readonly_probe(
+                        session_factory=lambda session=session: session,
+                        environment=_CREDENTIAL_ENV,
+                    )
+
+                session.lottery.inspect_once.assert_not_awaited()
+                session.lottery.inspect.assert_not_awaited()
+                self.assertEqual(session.home_calls, 1)
+                self.assertTrue(session.exited)
+
+    async def test_lottery_probe_refuses_untrusted_or_wrong_realm(self) -> None:
+        destinations = (
+            "https://example.test/",
+            "https://hentaiverse.org/isekai/",
+            "https://hentaiverse.org/unexpected",
+        )
+        for destination in destinations:
+            with self.subTest(destination=destination):
+                session = _FakeSession()
+                session.browser.page.observation_payload = {
+                    "url": destination,
+                    "challenge": False,
+                    "completion": False,
+                    "nextFloor": False,
+                    "active": False,
+                }
+
+                with self.assertRaisesRegex(LiveProbeRefused, "Persistent realm"):
+                    await run_lottery_readonly_probe(
+                        session_factory=lambda session=session: session,
+                        environment=_CREDENTIAL_ENV,
+                    )
+
+                session.lottery.inspect_once.assert_not_awaited()
+                session.lottery.inspect.assert_not_awaited()
+                self.assertEqual(session.home_calls, 1)
+                self.assertTrue(session.exited)
+
+    async def test_lottery_probe_fails_closed_without_retry_and_closes(self) -> None:
+        session = _FakeSession()
+        session.lottery.inspect_once.side_effect = RuntimeError("unreadable")
+
+        with self.assertRaisesRegex(RuntimeError, "unreadable"):
+            await run_lottery_readonly_probe(
+                session_factory=lambda: session,
+                environment=_CREDENTIAL_ENV,
+            )
+
+        self.assertEqual(session.lottery.inspect_once.await_count, 1)
+        session.lottery.inspect.assert_not_awaited()
+        session.player.read_stamina.assert_not_awaited()
+        session.market.inspect.assert_not_awaited()
+        session.monster_lab.inspect.assert_not_awaited()
+        self.assertEqual(session.home_calls, 1)
+        self.assertTrue(session.exited)
+
+    async def test_lottery_probe_refuses_invalid_preflight_payload(self) -> None:
+        session = _FakeSession()
+        session.browser.page.observation_payload = None
+
+        with self.assertRaisesRegex(LiveProbeRefused, "Unable to verify"):
+            await run_lottery_readonly_probe(
+                session_factory=lambda: session,
+                environment=_CREDENTIAL_ENV,
+            )
+
+        session.lottery.inspect_once.assert_not_awaited()
+        session.lottery.inspect.assert_not_awaited()
+        self.assertEqual(session.home_calls, 1)
+        self.assertTrue(session.exited)
+
+    async def test_lottery_probe_preserves_browser_generation_failure(self) -> None:
+        session = _FakeSession()
+        failure = ZendriverOperationTimeout(timeout_seconds=5)
+
+        with (
+            patch(
+                "hvbrowser.live_probe.observe_maintenance_navigation",
+                new=AsyncMock(side_effect=failure),
+            ),
+            self.assertRaises(ZendriverOperationTimeout) as raised,
+        ):
+            await run_lottery_readonly_probe(
+                session_factory=lambda: session,
+                environment=_CREDENTIAL_ENV,
+            )
+
+        self.assertIs(raised.exception, failure)
+        session.lottery.inspect_once.assert_not_awaited()
+        self.assertEqual(session.home_calls, 1)
+        self.assertTrue(session.exited)
+
     async def test_credential_guard_runs_before_session_construction(self) -> None:
         factory = Mock()
 
@@ -84,13 +269,14 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
     async def test_active_battle_stops_before_non_battle_checks(self) -> None:
         session = _FakeSession(in_battle=True)
 
-        with self.assertRaisesRegex(LiveProbeRefused, "active battle"):
+        with self.assertRaisesRegex(LiveProbeRefused, "battle state"):
             await run_live_probe(
                 session_factory=lambda: session,
                 environment=_CREDENTIAL_ENV,
             )
 
         session.player.read_stamina.assert_not_awaited()
+        self.assertEqual(session.home_calls, 1)
         self.assertTrue(session.exited)
 
     async def test_market_form_requires_market_before_session_construction(
@@ -121,7 +307,7 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
             order_text="100 C",
             current_stock=15,
         )
-        session.lottery.inspect.side_effect = [
+        session.lottery.inspect_once.side_effect = [
             LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200),
             LotterySnapshot(LotteryKind.ARMOR, 1_600_000, 100),
         ]
@@ -148,7 +334,7 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result.monster_lab and result.monster_lab.food_available)
         self.assertTrue(result.monster_lab and result.monster_lab.drugs_available)
         self.assertEqual(
-            session.lottery.inspect.await_args_list,
+            session.lottery.inspect_once.await_args_list,
             [
                 unittest.mock.call(
                     LotteryKind.WEAPON,
@@ -173,7 +359,7 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
         self,
     ) -> None:
         session = _FakeSession()
-        session.lottery.inspect.side_effect = [
+        session.lottery.inspect_once.side_effect = [
             LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200),
             LotterySnapshot(LotteryKind.ARMOR, 1_600_000, 100),
         ]
@@ -211,6 +397,7 @@ class LiveProbeTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result.lotteries, ())
         self.assertIsNone(result.monster_lab)
         session.market.inspect.assert_not_awaited()
+        session.lottery.inspect_once.assert_not_awaited()
         session.lottery.inspect.assert_not_awaited()
         session.monster_lab.inspect.assert_not_awaited()
 

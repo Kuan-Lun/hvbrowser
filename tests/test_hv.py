@@ -150,18 +150,35 @@ class HentaiVerseSessionTests(unittest.IsolatedAsyncioTestCase):
         with self.assertRaisesRegex(TypeError, "injected browser"):
             HentaiVerseSession(headless=False, browser=browser)  # type: ignore[arg-type]
 
-    async def test_start_orders_browser_hook_login_and_home(self) -> None:
+    async def test_start_logs_in_lands_once_then_runs_safety_hook(
+        self,
+    ) -> None:
         events: list[str] = []
         browser = self._browser(events)
         session = HentaiVerseSession(browser=browser)  # type: ignore[arg-type]
 
         async def browser_ready() -> None:
-            events.append("hook")
+            events.append("browser-hook")
 
-        entered = await session.start(on_browser_ready=browser_ready)
+        async def persistent_ready() -> None:
+            events.append("persistent-hook")
+
+        entered = await session.start(
+            on_browser_ready=browser_ready,
+            on_persistent_ready=persistent_ready,
+        )
 
         self.assertIs(entered, session)
-        self.assertEqual(events, ["initialize", "hook", "login", "home"])
+        self.assertEqual(
+            events,
+            [
+                "initialize",
+                "browser-hook",
+                "login",
+                "home",
+                "persistent-hook",
+            ],
+        )
         browser.gohomepage.assert_awaited_once_with(force=False)
 
         await session.__aexit__(None, None, None)
@@ -170,12 +187,33 @@ class HentaiVerseSessionTests(unittest.IsolatedAsyncioTestCase):
     async def test_start_failure_closes_the_raw_browser(self) -> None:
         events: list[str] = []
         browser = self._browser(events)
-        browser.login.side_effect = RuntimeError("login failed")
+        browser.login.side_effect = RuntimeError("authentication failed")
         session = HentaiVerseSession(browser=browser)  # type: ignore[arg-type]
 
-        with self.assertRaisesRegex(RuntimeError, "login failed"):
+        with self.assertRaisesRegex(RuntimeError, "authentication failed"):
             await session.start()
 
+        browser.__aexit__.assert_awaited_once()
+
+    async def test_persistent_hook_failure_follows_one_home_and_closes(
+        self,
+    ) -> None:
+        events: list[str] = []
+        browser = self._browser(events)
+        session = HentaiVerseSession(browser=browser)  # type: ignore[arg-type]
+
+        async def refuse() -> None:
+            events.append("persistent-hook")
+            raise RuntimeError("unsafe page")
+
+        with self.assertRaisesRegex(RuntimeError, "unsafe page"):
+            await session.start(on_persistent_ready=refuse)
+
+        self.assertEqual(
+            events,
+            ["initialize", "login", "home", "persistent-hook", "close"],
+        )
+        browser.gohomepage.assert_awaited_once_with(force=False)
         browser.__aexit__.assert_awaited_once()
 
 

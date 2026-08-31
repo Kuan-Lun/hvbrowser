@@ -12,7 +12,7 @@ license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
-    "hbrowser>=0.42.7,<0.43",
+    "hbrowser>=0.44.0,<0.45",
     # hvbrowser imports zendriver.cdp directly; keep this exact runtime cohort
     # aligned with hbrowser's verified Zendriver constraint.
     "zendriver==0.16.0",

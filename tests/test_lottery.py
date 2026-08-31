@@ -1,5 +1,6 @@
 import unittest
-from typing import Any
+from collections.abc import Callable
+from typing import Any, cast
 from unittest.mock import AsyncMock, patch
 
 from hbrowser import BrowserMutationOutcomeUnknownError
@@ -20,11 +21,15 @@ from hvbrowser.runtime import PageStateTimeout, ZendriverOperationTimeout
 class _TicketInput:
     def __init__(self) -> None:
         self.value = ""
+        self.clear_calls = 0
+        self.send_calls = 0
 
     async def clear_input(self) -> None:
+        self.clear_calls += 1
         self.value = ""
 
     async def send_keys(self, value: str) -> None:
+        self.send_calls += 1
         self.value = value
 
 
@@ -39,13 +44,24 @@ class _Page:
         self.submit_error: Exception | None = None
         self.preserve_after_submit = False
         self.server_rejection: str | None = None
+        self.server_rejection_page_text: str | None = None
         self.submissions = 0
         self.expressions: list[str] = []
+        self.page_text_override: str | None = None
 
     def state(self) -> dict[str, object]:
         return {
-            "balanceText": f"You currently have {self.gp:,} GP",
-            "ticketText": f"You hold {self.tickets:,} tickets",
+            "pageText": (
+                self.page_text_override
+                if self.page_text_override is not None
+                else "\n".join(
+                    (
+                        f"You currently have {self.gp:,} GP.",
+                        f"You hold {self.tickets:,} tickets.",
+                        "Each ticket costs 1,000 GP.",
+                    )
+                )
+            ),
             "hasTicketInput": self.has_input,
             "canSubmit": self.can_submit,
             "errorText": self.error,
@@ -59,6 +75,8 @@ class _Page:
                 raise self.submit_error
             if self.server_rejection is not None:
                 self.error = self.server_rejection
+                if self.server_rejection_page_text is not None:
+                    self.page_text_override = self.server_rejection_page_text
                 return None
             amount = int(self.input.value)
             if not self.preserve_after_submit:
@@ -90,13 +108,131 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertEqual(snapshot, LotterySnapshot(LotteryKind.WEAPON, 1_600_000, 200))
         self.assertEqual(len(page.expressions), 1)
+        state_expression = page.expressions[0]
+        self.assertIn("hvbrowser-lottery-state-v2", state_expression)
+        self.assertEqual(state_expression.count("document.body.innerText"), 1)
+        self.assertNotIn("querySelectorAll", state_expression)
+        self.assertNotIn(".textContent", state_expression)
+
+    async def test_inspect_parses_realistic_wrapper_text_without_ancestor_bias(
+        self,
+    ) -> None:
+        page = _Page(gp=8_077_830, tickets=87)
+        page.page_text_override = """
+            Weapon Lottery
+            Drawing 2026
+            You hold 87 tickets.
+            Prizes Remaining: 14
+            You currently have 8,077,830 GP.
+            Each ticket costs 1,000 GP.
+        """
+        client = _client(page)
+        client._navigate = AsyncMock()  # type: ignore[method-assign]
+
+        snapshot = await client.inspect(
+            LotteryKind.WEAPON,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
+
+        self.assertEqual(
+            snapshot,
+            LotterySnapshot(LotteryKind.WEAPON, 8_077_830, 87, 1_000),
+        )
+
+    async def test_inspect_ignores_unrelated_numbers_and_field_order(self) -> None:
+        page = _Page()
+        page.page_text_override = """
+            Round 19
+            Each ticket costs 1,000 GP.
+            You currently have 8,077,830 GP.
+            Jackpot 25,000 GP
+            You hold 87 tickets.
+        """
+        client = _client(page)
+        client._navigate = AsyncMock()  # type: ignore[method-assign]
+
+        snapshot = await client.inspect(
+            LotteryKind.ARMOR,
+            context=MaintenanceNavigationContext.ORDINARY,
+        )
+
+        self.assertEqual(snapshot.gp_balance, 8_077_830)
+        self.assertEqual(snapshot.tickets, 87)
+        self.assertEqual(snapshot.ticket_price_gp, 1_000)
+
+    async def test_inspect_accepts_zero_plain_grouped_and_nonbreaking_spaces(
+        self,
+    ) -> None:
+        cases = (
+            ("0", "1", 0, 1),
+            ("999", "0", 999, 0),
+            ("8,077,830", "12,345", 8_077_830, 12_345),
+        )
+        for gp_text, ticket_text, expected_gp, expected_tickets in cases:
+            with self.subTest(gp=gp_text, tickets=ticket_text):
+                page = _Page()
+                page.page_text_override = (
+                    f"You\N{NO-BREAK SPACE}hold {ticket_text} tickets.\n"
+                    f"You currently have {gp_text} GP.\n"
+                    "Each ticket costs 1,000 GP."
+                )
+                client = _client(page)
+                client._navigate = AsyncMock()  # type: ignore[method-assign]
+
+                snapshot = await client.inspect(
+                    LotteryKind.WEAPON,
+                    context=MaintenanceNavigationContext.ORDINARY,
+                )
+
+                self.assertEqual(snapshot.gp_balance, expected_gp)
+                self.assertEqual(snapshot.tickets, expected_tickets)
+
+    async def test_inspect_rejects_missing_malformed_or_ambiguous_fields(self) -> None:
+        valid = """
+            You hold 87 tickets.
+            You currently have 8,077,830 GP.
+            Each ticket costs 1,000 GP.
+        """
+        invalid_texts = {
+            "malformed GP grouping": valid.replace("8,077,830", "8,07,830"),
+            "leading-zero tickets": valid.replace("87 tickets", "087 tickets"),
+            "Unicode digits": valid.replace("87 tickets", "８７ tickets"),
+            "missing balance": valid.replace(
+                "You currently have 8,077,830 GP.", "Balance unavailable."
+            ),
+            "duplicate balance": valid + "\nYou currently have 1 GP.",
+            "duplicate tickets": valid + "\nYou hold 1 ticket.",
+            "duplicate price": valid + "\nEach ticket costs 1,000 GP.",
+            "wrong price": valid.replace("costs 1,000 GP", "costs 2,000 GP"),
+        }
+        for name, page_text in invalid_texts.items():
+            with self.subTest(case=name):
+                page = _Page()
+                page.page_text_override = page_text
+                client = _client(page)
+                client._navigate = AsyncMock()  # type: ignore[method-assign]
+                client._open_directly = AsyncMock()  # type: ignore[method-assign]
+
+                with self.assertRaises(LotteryPageError):
+                    await client.inspect(
+                        LotteryKind.WEAPON,
+                        context=MaintenanceNavigationContext.ORDINARY,
+                    )
+
+                client._open_directly.assert_awaited_once()
 
     async def test_inspect_retries_direct_url_once_on_unreadable_snapshot(self) -> None:
         page = _Page()
         page.evaluate = AsyncMock(
             side_effect=[
-                {**page.state(), "balanceText": "no GP"},
-                {**page.state(), "balanceText": "still no GP"},
+                {
+                    **page.state(),
+                    "pageText": "You hold 200 tickets.\nEach ticket costs 1,000 GP.",
+                },
+                {
+                    **page.state(),
+                    "pageText": "You hold 200 tickets.\nEach ticket costs 1,000 GP.",
+                },
             ]
         )
         client = _client(page)
@@ -110,6 +246,23 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             )
 
         client._open_directly.assert_awaited_once()
+
+    async def test_probe_inspection_fails_closed_without_reload(self) -> None:
+        page = _Page()
+        page.page_text_override = "You hold 200 tickets.\nEach ticket costs 1,000 GP."
+        client = _client(page)
+        client._navigate = AsyncMock()  # type: ignore[method-assign]
+        client._open_directly = AsyncMock()  # type: ignore[method-assign]
+
+        with self.assertRaisesRegex(LotteryPageError, "GP balance"):
+            await client.inspect_once(
+                LotteryKind.WEAPON,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        client._navigate.assert_awaited_once()
+        client._open_directly.assert_not_awaited()
+        self.assertEqual(len(page.expressions), 1)
 
     async def test_invalid_amount_is_rejected_before_inspection(self) -> None:
         client = _client(_Page())
@@ -167,6 +320,32 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
                 context=MaintenanceNavigationContext.ORDINARY,
             )
 
+        self.assertEqual(page.input.clear_calls, 0)
+        self.assertEqual(page.input.send_calls, 0)
+        self.assertEqual(page.submissions, 0)
+
+    async def test_malformed_fresh_state_stops_before_any_form_mutation(self) -> None:
+        page = _Page(gp=8_077_830, tickets=87)
+        page.page_text_override = """
+            You hold 87 tickets.
+            You currently have 8,07,830 GP.
+            Each ticket costs 1,000 GP.
+        """
+        client = _client(page)
+        before = LotterySnapshot(LotteryKind.WEAPON, 8_077_830, 87)
+        client.inspect = AsyncMock(return_value=before)  # type: ignore[method-assign]
+
+        with self.assertRaises(LotteryPageError):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(page.input.clear_calls, 0)
+        self.assertEqual(page.input.send_calls, 0)
+        self.assertEqual(page.submissions, 0)
+
     async def test_purchase_confirms_exact_gp_and_ticket_change(self) -> None:
         page = _Page()
         client = _client(page)
@@ -189,6 +368,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_server_rejection_is_typed_without_replay(self) -> None:
         page = _Page(gp=1_000, tickets=0)
         page.server_rejection = "Lottery is closed"
+        page.server_rejection_page_text = "ambiguous receipt without Lottery fields"
         client = _client(page)
         client.inspect = AsyncMock(  # type: ignore[method-assign]
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
@@ -211,8 +391,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
         confirmed = _LotteryPageState(
-            "You currently have 0 GP",
-            "You hold 1 tickets",
+            "You currently have 0 GP.\nYou hold 1 ticket.\nEach ticket costs 1,000 GP.",
             True,
             True,
             None,
@@ -233,6 +412,101 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(page.submissions, 1)
         receipt_deadline = state_wait.await_args.kwargs["deadline"]
         self.assertGreater(receipt_deadline.remaining(), 6)
+
+    async def test_receipt_ignores_ambiguous_state_then_accepts_exact_state(
+        self,
+    ) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        page.preserve_after_submit = True
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
+        ambiguous = _LotteryPageState(
+            "You hold 1 ticket.\n"
+            "You currently have 0 GP.\n"
+            "You currently have 1,000 GP.\n"
+            "Each ticket costs 1,000 GP.",
+            True,
+            True,
+            None,
+        )
+        exact = _LotteryPageState(
+            "You hold 1 ticket.\nYou currently have 0 GP.\nEach ticket costs 1,000 GP.",
+            True,
+            True,
+            None,
+        )
+
+        async def wait_for_receipt(
+            _page: object,
+            **kwargs: object,
+        ) -> _LotteryPageState:
+            accept = cast(
+                Callable[[_LotteryPageState], bool],
+                kwargs["accept"],
+            )
+            self.assertFalse(accept(ambiguous))
+            self.assertTrue(accept(exact))
+            return exact
+
+        with patch(
+            "hvbrowser.lottery.wait_for_page_state",
+            new=AsyncMock(side_effect=wait_for_receipt),
+        ):
+            report = await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(report.after.gp_balance, 0)
+        self.assertEqual(report.after.tickets, 1)
+        self.assertEqual(page.submissions, 1)
+
+    async def test_persistently_ambiguous_receipt_is_unknown_without_replay(
+        self,
+    ) -> None:
+        page = _Page(gp=1_000, tickets=0)
+        client = _client(page)
+        client.inspect = AsyncMock(  # type: ignore[method-assign]
+            return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
+        )
+        ambiguous = _LotteryPageState(
+            "You hold 1 ticket.\n"
+            "You currently have 0 GP.\n"
+            "You currently have 1,000 GP.\n"
+            "Each ticket costs 1,000 GP.",
+            True,
+            True,
+            None,
+        )
+
+        async def reject_receipt(
+            _page: object,
+            **kwargs: object,
+        ) -> _LotteryPageState:
+            accept = cast(
+                Callable[[_LotteryPageState], bool],
+                kwargs["accept"],
+            )
+            self.assertFalse(accept(ambiguous))
+            raise PageStateTimeout("ambiguous")
+
+        with (
+            patch(
+                "hvbrowser.lottery.wait_for_page_state",
+                new=AsyncMock(side_effect=reject_receipt),
+            ),
+            self.assertRaisesRegex(LotterySubmissionError, "Unable to confirm"),
+        ):
+            await client.purchase(
+                LotteryKind.WEAPON,
+                1,
+                context=MaintenanceNavigationContext.ORDINARY,
+            )
+
+        self.assertEqual(page.submissions, 1)
 
     async def test_missing_submit_api_fails_before_input_mutation(self) -> None:
         page = _Page(gp=1_000, tickets=0)
