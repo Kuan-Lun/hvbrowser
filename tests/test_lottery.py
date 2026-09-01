@@ -37,6 +37,7 @@ class _Page:
     def __init__(self, *, gp: int = 1_600_000, tickets: int = 200) -> None:
         self.gp = gp
         self.tickets = tickets
+        self.sold_tickets = max(tickets, 3_453)
         self.has_input = True
         self.can_submit = True
         self.error: str | None = None
@@ -57,7 +58,8 @@ class _Page:
                 else "\n".join(
                     (
                         f"You currently have {self.gp:,} GP.",
-                        f"You hold {self.tickets:,} tickets.",
+                        "You hold "
+                        f"{self.tickets:,} of {self.sold_tickets:,} sold tickets.",
                         "Each ticket costs 1,000 GP.",
                     )
                 )
@@ -81,6 +83,7 @@ class _Page:
             amount = int(self.input.value)
             if not self.preserve_after_submit:
                 self.tickets += amount
+                self.sold_tickets += amount
                 self.gp -= amount * 1_000
             return None
         return self.state()
@@ -121,7 +124,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         page.page_text_override = """
             Weapon Lottery
             Drawing 2026
-            You hold 87 tickets.
+            You hold 87 of 3,453 sold tickets.
             Prizes Remaining: 14
             You currently have 8,077,830 GP.
             Each ticket costs 1,000 GP.
@@ -146,7 +149,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             Each ticket costs 1,000 GP.
             You currently have 8,077,830 GP.
             Jackpot 25,000 GP
-            You hold 87 tickets.
+            You hold 87 of 3,453 sold tickets.
         """
         client = _client(page)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
@@ -172,7 +175,8 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(gp=gp_text, tickets=ticket_text):
                 page = _Page()
                 page.page_text_override = (
-                    f"You\N{NO-BREAK SPACE}hold {ticket_text} tickets.\n"
+                    "You\N{NO-BREAK SPACE}hold "
+                    f"{ticket_text} of 12,345 sold tickets.\n"
                     f"You currently have {gp_text} GP.\n"
                     "Each ticket costs 1,000 GP."
                 )
@@ -189,19 +193,25 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_inspect_rejects_missing_malformed_or_ambiguous_fields(self) -> None:
         valid = """
-            You hold 87 tickets.
+            You hold 87 of 3,453 sold tickets.
             You currently have 8,077,830 GP.
             Each ticket costs 1,000 GP.
         """
         invalid_texts = {
             "malformed GP grouping": valid.replace("8,077,830", "8,07,830"),
-            "leading-zero tickets": valid.replace("87 tickets", "087 tickets"),
-            "Unicode digits": valid.replace("87 tickets", "８７ tickets"),
+            "leading-zero tickets": valid.replace("hold 87", "hold 087"),
+            "Unicode digits": valid.replace("hold 87", "hold ８７"),
+            "malformed ticket grouping": valid.replace("hold 87", "hold 8,7"),
             "missing balance": valid.replace(
                 "You currently have 8,077,830 GP.", "Balance unavailable."
             ),
             "duplicate balance": valid + "\nYou currently have 1 GP.",
-            "duplicate tickets": valid + "\nYou hold 1 ticket.",
+            "duplicate tickets": valid + "\nYou hold 1 of 3,453 sold tickets.",
+            "missing sold total": valid.replace(
+                "87 of 3,453 sold tickets", "87 tickets"
+            ),
+            "malformed sold total": valid.replace("3,453", "3,45"),
+            "ticket count exceeds sold total": valid.replace("3,453", "86"),
             "duplicate price": valid + "\nEach ticket costs 1,000 GP.",
             "wrong price": valid.replace("costs 1,000 GP", "costs 2,000 GP"),
         }
@@ -227,11 +237,17 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             side_effect=[
                 {
                     **page.state(),
-                    "pageText": "You hold 200 tickets.\nEach ticket costs 1,000 GP.",
+                    "pageText": (
+                        "You hold 200 of 3,453 sold tickets.\n"
+                        "Each ticket costs 1,000 GP."
+                    ),
                 },
                 {
                     **page.state(),
-                    "pageText": "You hold 200 tickets.\nEach ticket costs 1,000 GP.",
+                    "pageText": (
+                        "You hold 200 of 3,453 sold tickets.\n"
+                        "Each ticket costs 1,000 GP."
+                    ),
                 },
             ]
         )
@@ -249,7 +265,9 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
 
     async def test_probe_inspection_fails_closed_without_reload(self) -> None:
         page = _Page()
-        page.page_text_override = "You hold 200 tickets.\nEach ticket costs 1,000 GP."
+        page.page_text_override = (
+            "You hold 200 of 3,453 sold tickets.\nEach ticket costs 1,000 GP."
+        )
         client = _client(page)
         client._navigate = AsyncMock()  # type: ignore[method-assign]
         client._open_directly = AsyncMock()  # type: ignore[method-assign]
@@ -327,7 +345,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
     async def test_malformed_fresh_state_stops_before_any_form_mutation(self) -> None:
         page = _Page(gp=8_077_830, tickets=87)
         page.page_text_override = """
-            You hold 87 tickets.
+            You hold 87 of 3,453 sold tickets.
             You currently have 8,07,830 GP.
             Each ticket costs 1,000 GP.
         """
@@ -391,7 +409,9 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
         confirmed = _LotteryPageState(
-            "You currently have 0 GP.\nYou hold 1 ticket.\nEach ticket costs 1,000 GP.",
+            "You currently have 0 GP.\n"
+            "You hold 1 of 3,454 sold tickets.\n"
+            "Each ticket costs 1,000 GP.",
             True,
             True,
             None,
@@ -413,7 +433,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
         receipt_deadline = state_wait.await_args.kwargs["deadline"]
         self.assertGreater(receipt_deadline.remaining(), 6)
 
-    async def test_receipt_ignores_ambiguous_state_then_accepts_exact_state(
+    async def test_receipt_accepts_exact_owned_and_gp_with_changed_sold_total(
         self,
     ) -> None:
         page = _Page(gp=1_000, tickets=0)
@@ -423,7 +443,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
         ambiguous = _LotteryPageState(
-            "You hold 1 ticket.\n"
+            "You hold 1 of 3,454 sold tickets.\n"
             "You currently have 0 GP.\n"
             "You currently have 1,000 GP.\n"
             "Each ticket costs 1,000 GP.",
@@ -432,7 +452,9 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             None,
         )
         exact = _LotteryPageState(
-            "You hold 1 ticket.\nYou currently have 0 GP.\nEach ticket costs 1,000 GP.",
+            "You hold 1 of 4,000 sold tickets.\n"
+            "You currently have 0 GP.\n"
+            "Each ticket costs 1,000 GP.",
             True,
             True,
             None,
@@ -473,7 +495,7 @@ class LotteryClientTests(unittest.IsolatedAsyncioTestCase):
             return_value=LotterySnapshot(LotteryKind.WEAPON, 1_000, 0)
         )
         ambiguous = _LotteryPageState(
-            "You hold 1 ticket.\n"
+            "You hold 1 of 3,454 sold tickets.\n"
             "You currently have 0 GP.\n"
             "You currently have 1,000 GP.\n"
             "Each ticket costs 1,000 GP.",

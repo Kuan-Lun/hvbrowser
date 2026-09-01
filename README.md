@@ -75,7 +75,9 @@ complete label for the ticket count, GP balance, and ticket price. Missing,
 malformed, duplicate, or unsupported-price fields fail closed. `inspect()` may
 perform its documented one-time direct reload after an unreadable landing;
 `inspect_once()` performs no recovery navigation and is intended for tightly
-bounded read-only probes.
+bounded read-only probes. The ticket-count label is read from the page's
+`You hold <owned> of <sold> sold tickets` field; the owned amount is returned,
+while the sold total is validated as an integrity boundary.
 
 ```python
 from hvbrowser import LotteryKind, MaintenanceNavigationContext

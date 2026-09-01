@@ -49,7 +49,7 @@ def _driver(page: object) -> SimpleNamespace:
 def _lottery_state(
     *,
     balance: str | None = "You currently have 1,600,000 GP",
-    tickets: str | None = "You hold 200 tickets",
+    tickets: str | None = "You hold 200 of 3,453 sold tickets",
     price: str | None = "Each ticket costs 1,000 GP",
 ) -> dict[str, object]:
     return {
@@ -1103,7 +1103,7 @@ class MaintenanceClientIntegrationTests(unittest.IsolatedAsyncioTestCase):
             if "nextFloor" in script and "battle_main" in script:
                 return _markers(url="https://hentaiverse.org/?s=Bazaar&ss=la")
             if "hvbrowser-lottery-state-v2" in script:
-                return _lottery_state(tickets="You hold 100 tickets")
+                return _lottery_state(tickets="You hold 100 of 3,453 sold tickets")
             raise AssertionError(f"Unexpected evaluate script: {script!r}")
 
         page = SimpleNamespace(

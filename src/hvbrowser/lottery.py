@@ -49,7 +49,8 @@ _LOTTERY_STATE_SCRIPT = r"""
 _LOTTERY_AMOUNT_PATTERN = r"(?:0|[1-9][0-9]*|[1-9][0-9]{0,2}(?:,[0-9]{3})+)"
 _LOTTERY_TICKET_COUNT_LABEL = re.compile(r"You\s+hold\b")
 _LOTTERY_TICKET_COUNT = re.compile(
-    rf"You\s+hold\s+(?P<amount>{_LOTTERY_AMOUNT_PATTERN})\s+tickets?\b"
+    rf"You\s+hold\s+(?P<held>{_LOTTERY_AMOUNT_PATTERN})\s+of\s+"
+    rf"(?P<sold_total>{_LOTTERY_AMOUNT_PATTERN})\s+sold\s+tickets?\b"
 )
 _LOTTERY_GP_BALANCE_LABEL = re.compile(r"You\s+currently\s+have\b")
 _LOTTERY_GP_BALANCE = re.compile(
@@ -155,6 +156,20 @@ def _decode_lottery_state(raw: object) -> _LotteryPageState:
     )
 
 
+def _match_unique_lottery_field(
+    page_text: str,
+    *,
+    label_pattern: re.Pattern[str],
+    value_pattern: re.Pattern[str],
+    field: str,
+) -> re.Match[str]:
+    label_count = sum(1 for _ in label_pattern.finditer(page_text))
+    matches = tuple(value_pattern.finditer(page_text))
+    if label_count != 1 or len(matches) != 1:
+        raise LotteryPageError(f"Lottery {field} is missing, malformed, or ambiguous")
+    return matches[0]
+
+
 def _parse_unique_lottery_amount(
     page_text: str,
     *,
@@ -162,21 +177,32 @@ def _parse_unique_lottery_amount(
     value_pattern: re.Pattern[str],
     field: str,
 ) -> int:
-    label_count = sum(1 for _ in label_pattern.finditer(page_text))
-    matches = tuple(value_pattern.finditer(page_text))
-    if label_count != 1 or len(matches) != 1:
-        raise LotteryPageError(f"Lottery {field} is missing, malformed, or ambiguous")
-    return int(matches[0].group("amount").replace(",", ""))
+    match = _match_unique_lottery_field(
+        page_text,
+        label_pattern=label_pattern,
+        value_pattern=value_pattern,
+        field=field,
+    )
+    return int(match.group("amount").replace(",", ""))
 
 
-def _parse_lottery_amounts(page_text: str) -> _LotteryAmounts:
-    normalized = page_text.replace("\N{NO-BREAK SPACE}", " ")
-    tickets = _parse_unique_lottery_amount(
-        normalized,
+def _parse_lottery_ticket_count(page_text: str) -> int:
+    match = _match_unique_lottery_field(
+        page_text,
         label_pattern=_LOTTERY_TICKET_COUNT_LABEL,
         value_pattern=_LOTTERY_TICKET_COUNT,
         field="ticket count",
     )
+    tickets = int(match.group("held").replace(",", ""))
+    sold_total = int(match.group("sold_total").replace(",", ""))
+    if tickets > sold_total:
+        raise LotteryPageError("Lottery ticket count exceeds the sold total")
+    return tickets
+
+
+def _parse_lottery_amounts(page_text: str) -> _LotteryAmounts:
+    normalized = page_text.replace("\N{NO-BREAK SPACE}", " ")
+    tickets = _parse_lottery_ticket_count(normalized)
     gp_balance = _parse_unique_lottery_amount(
         normalized,
         label_pattern=_LOTTERY_GP_BALANCE_LABEL,
