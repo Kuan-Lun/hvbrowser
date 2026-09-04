@@ -1,5 +1,5 @@
 {
-  "checked_at": "2026-09-01T05:38:40+00:00",
+  "checked_at": "2026-09-04T06:20:58+00:00",
   "manifest_sha256": "800372cd76e7f89e6b1bfaa93edd4bf5756b41ce09e485338406eba01d9ccbbc",
   "node": [
     {
@@ -10,7 +10,7 @@
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.1",
+  "project_version": "0.10.2",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
@@ -26,8 +26,8 @@
     {
       "declared": "hbrowser>=0.44.0,<0.45",
       "group": "runtime",
-      "latest": "0.43.1",
-      "latest_satisfies": false,
+      "latest": "0.44.0",
+      "latest_satisfies": true,
       "name": "hbrowser",
       "python_3_14": true,
       "registry_url": "https://pypi.org/project/hbrowser/",
@@ -103,7 +103,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.5",
+      "latest": "0.16.6",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -113,7 +113,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all build, runtime, development, and Node direct dependencies for the 0.10.1 compatible parser fix. Dependency declarations are unchanged. The locally merged, pre-publication hbrowser 0.44.0 candidate remains the required authentication-only contract and has already passed its full gate; hvbrowser continues to validate against that candidate with Zendriver 0.16.0. Current registry releases for every other direct dependency remain within the declared constraints, and this change introduces no new dependency surface.",
+    "note": "Reviewed all direct dependencies for 0.10.2. The account context now fulfills hbrowser 0.44's authentication-only contract by owning the first verified Persistent navigation; dependency declarations remain unchanged and the existing hbrowser and Zendriver lifecycle cohort is retained.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
