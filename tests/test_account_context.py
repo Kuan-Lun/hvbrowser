@@ -25,6 +25,8 @@ from hvbrowser.realm import Realm
 from hvbrowser.runtime import ZendriverOperationTimeout, log_context
 from hvbrowser.urls import HENTAIVERSE_ISEKAI_ROOT_URL, HENTAIVERSE_ROOT_URL
 
+_AUTHENTICATED_FORUMS_URL = "https://forums.e-hentai.org/"
+
 
 @dataclass
 class _FakeTab:
@@ -130,7 +132,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
 
         async def authenticate(driver: RealmBoundHVDriver) -> None:
             authentication_targets.append(driver.tab_handle.target_id)
-            await driver.page.get(HENTAIVERSE_ROOT_URL)
+            await driver.page.get(_AUTHENTICATED_FORUMS_URL)
 
         context = HentaiVerseAccountContext(
             owner_id="account-test",
@@ -182,6 +184,10 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(context.persistent.driver.owns_browser)
             self.assertFalse(context.isekai.driver.owns_browser)
             self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
+            self.assertEqual(
+                persistent_tab.navigations,
+                [_AUTHENTICATED_FORUMS_URL, HENTAIVERSE_ROOT_URL],
+            )
             self.assertEqual(isekai_tab.url, HENTAIVERSE_ISEKAI_ROOT_URL)
 
         self.assertEqual(context.state, AccountContextState.CLOSED)
@@ -577,7 +583,7 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         async def authenticate(driver: RealmBoundHVDriver) -> None:
             nonlocal stop
             authentications.append(driver.tab_handle.target_id)
-            await driver.page.get(HENTAIVERSE_ROOT_URL)
+            await driver.page.get(_AUTHENTICATED_FORUMS_URL)
             stop = True
 
         context, _, persistent_tab, isekai_tab, browser_closer, _ = self._context(
@@ -590,6 +596,10 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(context.state, AccountContextState.CLOSED)
         self.assertEqual(authentications, ["persistent-target"])
         self.assertEqual(persistent_tab.url, HENTAIVERSE_ROOT_URL)
+        self.assertEqual(
+            persistent_tab.navigations,
+            [_AUTHENTICATED_FORUMS_URL, HENTAIVERSE_ROOT_URL],
+        )
         self.assertFalse(isekai_tab.opened)
         browser_closer.assert_awaited_once()
 

@@ -415,12 +415,14 @@ class RealmRuntime[TabT]:
         self,
         authenticator: AccountAuthenticator,
     ) -> None:
-        """Authenticate the account through this runtime's bootstrap tab.
+        """Authenticate, then establish this runtime's canonical realm root.
 
         Authentication applies to the shared browser account, not to the
         Persistent realm that happens to host the bootstrap tab.  Keep the tab
         role as diagnostic metadata while giving user-facing records an
-        explicit account-level label and no realm identity.
+        explicit account-level label and no realm identity.  Once the
+        authentication-only boundary returns, this higher-level runtime owns
+        the first HentaiVerse navigation and verifies its realm.
         """
 
         async with self._operation_lock:
@@ -435,7 +437,13 @@ class RealmRuntime[TabT]:
                     await authenticator(self._driver)
 
                 await self._transport.execute(authenticate)
-            await self._assert_current_realm()
+            with log_context(
+                account=self._account_label,
+                realm=self._realm.value,
+                tab_role=self.tab_handle.role,
+                activity="Establish",
+            ):
+                await self._navigate_home()
 
     async def _establish(self) -> None:
         with log_context(
