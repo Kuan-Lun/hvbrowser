@@ -1,21 +1,21 @@
 {
-  "checked_at": "2026-09-04T06:20:58+00:00",
-  "manifest_sha256": "800372cd76e7f89e6b1bfaa93edd4bf5756b41ce09e485338406eba01d9ccbbc",
+  "checked_at": "2026-10-12T05:15:54+00:00",
+  "manifest_sha256": "d93e594bb47d6a16368a68ed45ecbf9cd58a5c271654fa52636ae87dcc39bc85",
   "node": [
     {
       "declared": ">=0.18.1",
-      "latest": "0.23.2",
+      "latest": "0.23.3",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.2",
+  "project_version": "0.10.3",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.0",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -24,10 +24,10 @@
       "url": "https://pypi.org/project/hatchling/"
     },
     {
-      "declared": "hbrowser>=0.44.0,<0.45",
+      "declared": "hbrowser>=0.45.0,<0.46",
       "group": "runtime",
-      "latest": "0.44.0",
-      "latest_satisfies": true,
+      "latest": "0.44.2",
+      "latest_satisfies": false,
       "name": "hbrowser",
       "python_3_14": true,
       "registry_url": "https://pypi.org/project/hbrowser/",
@@ -35,9 +35,9 @@
       "url": "https://pypi.org/project/hbrowser/"
     },
     {
-      "declared": "zendriver==0.16.0",
+      "declared": "zendriver==0.17.1",
       "group": "runtime",
-      "latest": "0.16.0",
+      "latest": "0.17.1",
       "latest_satisfies": true,
       "name": "zendriver",
       "python_3_14": true,
@@ -48,7 +48,7 @@
     {
       "declared": "build>=1.3.0",
       "group": "optional:dev",
-      "latest": "1.6.0",
+      "latest": "1.6.1",
       "latest_satisfies": true,
       "name": "build",
       "python_3_14": true,
@@ -59,7 +59,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.0",
+      "latest": "1.32.4",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -70,7 +70,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.3.1",
+      "latest": "2.4.0",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -103,7 +103,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.16.6",
+      "latest": "0.17.0",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -113,7 +113,7 @@
     }
   ],
   "review": {
-    "note": "Reviewed all direct dependencies for 0.10.2. The account context now fulfills hbrowser 0.44's authentication-only contract by owning the first verified Persistent navigation; dependency declarations remain unchanged and the existing hbrowser and Zendriver lifecycle cohort is retained.",
+    "note": "Validated hbrowser 0.45.0 candidate wheel a1c70c3492d4a61f5d12244f9f5da5de05816b55f98209d75880490eb3b1b3c6 with exact Zendriver 0.17.1. Reviewed upstream Zendriver 0.17.0 event memory, flat CDP session and connection shutdown changes and 0.17.1 timeout fix; real transport regression evidence lives in hbrowser. Normal resolution installed 36 packages on CPython 3.14.8; offline suite passed 218 tests plus 136 subtests. Reviewed current Hatchling, build, mypy, packaging and Ruff release notes and validated strict fast gate without global relaxations. No HVBrowser public API or persisted data format is removed.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
