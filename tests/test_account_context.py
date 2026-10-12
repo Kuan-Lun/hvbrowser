@@ -34,6 +34,7 @@ class _FakeTab:
     url: str = "about:blank"
     navigations: list[str] = field(default_factory=list)
     opened: bool = False
+    browser: object | None = None
 
     async def evaluate(self, script: str) -> str:
         if script != "window.location.href":
@@ -115,6 +116,8 @@ class AccountContextTests(unittest.IsolatedAsyncioTestCase):
         persistent_tab = _FakeTab("persistent-target")
         isekai_tab = _FakeTab("isekai-target")
         browser = _FakeBrowser(persistent_tab)
+        persistent_tab.browser = browser
+        isekai_tab.browser = browser
         browser_closer = AsyncMock()
         authentication_targets: list[str] = []
 

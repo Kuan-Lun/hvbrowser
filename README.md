@@ -179,7 +179,9 @@ realms.
 ## Development
 
 HVBrowser 0.10 requires the authentication-only `Driver.login()` contract from
-`hbrowser>=0.44.0,<0.45`; earlier compatibility lines are not supported.
+`hbrowser>=0.45.0,<0.46` with Zendriver 0.17.1. The transport now removes
+completed event records itself; account and driver ownership, navigation,
+authentication, and HentaiVerse workflows remain available.
 
 Build a clean environment backed by the PyPI release of `hbrowser`:
 
@@ -187,14 +189,15 @@ Build a clean environment backed by the PyPI release of `hbrowser`:
 bash scripts/rebuild-env.sh
 ```
 
-For coordinated local development, overlay the local checkout after rebuilding:
+For coordinated local development, install the candidate wheel with normal
+dependency resolution:
 
 ```bash
-uv pip install --python .venv/bin/python --reinstall --no-deps --editable \
-  /path/to/hbrowser
+uv pip install --python .venv/bin/python --reinstall -e '.[dev]' \
+  /path/to/hbrowser-0.45.0-py3-none-any.whl
 ```
 
-Commands that must preserve the editable overlay use `uv run --no-sync`.
+Commands that must preserve this candidate use `uv run --no-sync`.
 
 ## License
 
