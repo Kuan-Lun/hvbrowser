@@ -1,21 +1,21 @@
 {
-  "checked_at": "2026-10-12T05:15:54+00:00",
-  "manifest_sha256": "d93e594bb47d6a16368a68ed45ecbf9cd58a5c271654fa52636ae87dcc39bc85",
+  "checked_at": "2026-10-31T07:23:16+00:00",
+  "manifest_sha256": "0cbf81783b950eb1ee545da08ac0d1b3021dbfbed86715d072f9bf91c1d25a90",
   "node": [
     {
       "declared": ">=0.18.1",
-      "latest": "0.23.3",
+      "latest": "0.24.0",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.3",
+  "project_version": "0.10.4",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -24,7 +24,7 @@
       "url": "https://pypi.org/project/hatchling/"
     },
     {
-      "declared": "hbrowser>=0.45.0,<0.46",
+      "declared": "hbrowser>=0.46.0,<0.47",
       "group": "runtime",
       "latest": "0.44.2",
       "latest_satisfies": false,
@@ -59,7 +59,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -70,7 +70,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.4.0",
+      "latest": "2.4.1",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -92,7 +92,7 @@
     {
       "declared": "pytest>=9.1.1",
       "group": "optional:dev",
-      "latest": "9.1.1",
+      "latest": "9.2.0",
       "latest_satisfies": true,
       "name": "pytest",
       "python_3_14": true,
@@ -103,7 +103,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.0",
+      "latest": "0.17.3",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -113,7 +113,7 @@
     }
   ],
   "review": {
-    "note": "Validated hbrowser 0.45.0 candidate wheel a1c70c3492d4a61f5d12244f9f5da5de05816b55f98209d75880490eb3b1b3c6 with exact Zendriver 0.17.1. Reviewed upstream Zendriver 0.17.0 event memory, flat CDP session and connection shutdown changes and 0.17.1 timeout fix; real transport regression evidence lives in hbrowser. Normal resolution installed 36 packages on CPython 3.14.8; offline suite passed 218 tests plus 136 subtests. Reviewed current Hatchling, build, mypy, packaging and Ruff release notes and validated strict fast gate without global relaxations. No HVBrowser public API or persisted data format is removed.",
+    "note": "2026-10-31: User-approved hbrowser 0.46 mutually authenticated logging cohort. HVBrowser requires >=0.46.0,<0.47 and retains directly imported Zendriver==0.17.1, matching the verified hbrowser lifecycle cohort. Parent and owned child processes must upgrade/restart together; existing JSONL logs and HVBrowser public APIs/data remain unchanged. Explicit hbrowser 0.46.0 author wheel SHA256 b1812e7f19d49387eae02d88f4110c207ee44c0996c457e0f83eccb947df867f previously passed normal dependency resolution and pip check here. It is not yet formally merged or published; registry-only bootstrap still cannot provide this candidate. New latest direct tools reviewed in this integration batch: hatchling 1.33.0 Python 3.15 support (https://hatch.pypa.io/latest/history/hatchling/), mypy 2.4.1 overload/mypyc fixes (https://mypy.readthedocs.io/en/stable/changelog.html), pytest 9.2.0 checked-hash assertion caches/config validation (https://docs.pytest.org/en/stable/changelog.html), Ruff 0.17.3 f-string/comment/format corrections (https://github.com/astral-sh/ruff/releases/tag/0.17.3), markdownlint-cli2 0.24.0 dependency updates requiring Node >=22 (https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md). Node 24 is installed. Fresh unchanged build 1.6.1, packaging 26.3 and Zendriver 0.17.1 reuse the attributed previous audit; existing bounds admit current tool versions. Formal hbrowser acceptance, HVBrowser current-dependency offline tests and the existing merge gate remain required before delivery. No live-account, native-Windows, publish or deploy proof is claimed.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
