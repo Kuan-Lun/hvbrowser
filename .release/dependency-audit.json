@@ -1,6 +1,6 @@
 {
-  "checked_at": "2026-10-31T07:23:16+00:00",
-  "manifest_sha256": "0cbf81783b950eb1ee545da08ac0d1b3021dbfbed86715d072f9bf91c1d25a90",
+  "checked_at": "2026-11-05T22:27:45+00:00",
+  "manifest_sha256": "e62ddd5503ba83c497bd698879f9adb1418e1859aa52fc64bb8268ff12b06970",
   "node": [
     {
       "declared": ">=0.18.1",
@@ -24,9 +24,9 @@
       "url": "https://pypi.org/project/hatchling/"
     },
     {
-      "declared": "hbrowser>=0.46.0,<0.47",
+      "declared": "hbrowser>=0.46.1,<0.47",
       "group": "runtime",
-      "latest": "0.44.2",
+      "latest": "0.46.0",
       "latest_satisfies": false,
       "name": "hbrowser",
       "python_3_14": true,
@@ -103,7 +103,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.3",
+      "latest": "0.17.4",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -113,7 +113,7 @@
     }
   ],
   "review": {
-    "note": "2026-10-31: User-approved hbrowser 0.46 mutually authenticated logging cohort. HVBrowser requires >=0.46.0,<0.47 and retains directly imported Zendriver==0.17.1, matching the verified hbrowser lifecycle cohort. Parent and owned child processes must upgrade/restart together; existing JSONL logs and HVBrowser public APIs/data remain unchanged. Explicit hbrowser 0.46.0 author wheel SHA256 b1812e7f19d49387eae02d88f4110c207ee44c0996c457e0f83eccb947df867f previously passed normal dependency resolution and pip check here. It is not yet formally merged or published; registry-only bootstrap still cannot provide this candidate. New latest direct tools reviewed in this integration batch: hatchling 1.33.0 Python 3.15 support (https://hatch.pypa.io/latest/history/hatchling/), mypy 2.4.1 overload/mypyc fixes (https://mypy.readthedocs.io/en/stable/changelog.html), pytest 9.2.0 checked-hash assertion caches/config validation (https://docs.pytest.org/en/stable/changelog.html), Ruff 0.17.3 f-string/comment/format corrections (https://github.com/astral-sh/ruff/releases/tag/0.17.3), markdownlint-cli2 0.24.0 dependency updates requiring Node >=22 (https://raw.githubusercontent.com/DavidAnson/markdownlint-cli2/v0.24.0/CHANGELOG.md). Node 24 is installed. Fresh unchanged build 1.6.1, packaging 26.3 and Zendriver 0.17.1 reuse the attributed previous audit; existing bounds admit current tool versions. Formal hbrowser acceptance, HVBrowser current-dependency offline tests and the existing merge gate remain required before delivery. No live-account, native-Windows, publish or deploy proof is claimed.",
+    "note": "2026-11-06 dependency-manifest refresh for hvbrowser 0.10.4; preserve the task's single existing version bump. Raise only the hbrowser lower bound to 0.46.1, retaining the 0.47 upper compatibility boundary and all other declared constraints. The accepted hbrowser 0.46.0 wheel exposed three existing HVBrowser close-retry failures: an already terminal cancelled/failed inner closer retained its expired generation deadline. The planned 0.46.1 repair must allow a new explicit caller to retry while retaining the old deadline for pending or late-successful cleanup. This requirement is not a claim that the repair or its final wheel has passed acceptance.\n\nThe previous audit SHA256 94630167ab9f6bd810113506fd94afb90d9db4940b38449fc6d7964e370a62f0 remains the attributed review of unchanged direct versions and their upstream release notes. Fresh official PyPI/npm metadata still reports the same external releases except Ruff 0.17.4. Newly read https://github.com/astral-sh/ruff/releases/tag/0.17.4 (2026-11-05): fixes semicolon parsing and BOM diagnostics, adjusts SIM102/preview G004, improves repeated-dictionary-key and formatter performance, honors NO_COLOR/CLICOLOR and strengthens __debug__ assignment syntax checks. Existing >=0.16.4 admits this release; explicit py314 and selected rules remain appropriate. No new excluded external stable release or demonstrated incompatibility calls for changing other bounds. Declared Python metadata admits 3.14; absent Requires-Python, such as distlib, is only metadata admission, not execution proof. markdownlint-cli2 0.24.0 requires Node>=22.\n\nPublished hbrowser is currently 0.46.0, below the deliberately required minimum. Wait for the accepted 0.46.1 wheel with exact metadata/payload proof and normal dependency resolution; do not substitute old 0.46.0 or fake metadata. Published Core 0.45.9, HVBrowser 0.10.2 and HVBattle 0.15.1 also remain below this integration batch's respective candidate requirements where declared. Their applicable explicit final artifacts and acceptance remain separate prerequisites. No registry-only readiness, new installation, suite pass or final compatibility result is claimed by this metadata refresh. Parent and owned children still upgrade/restart together; existing JSONL logs remain usable. Consumer runtime/tests, public APIs and data formats are unchanged; original failure oracles remain intact. Existing exact-candidate review/full gates and affected final dependency verification remain required before delivery. Retain directly imported Zendriver==0.17.1, the same declared lifecycle cohort as hbrowser.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
