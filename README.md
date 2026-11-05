@@ -178,10 +178,16 @@ realms.
 
 ## Development
 
-HVBrowser 0.10 requires the authentication-only `Driver.login()` contract from
-`hbrowser>=0.45.0,<0.46` with Zendriver 0.17.1. The transport now removes
+HVBrowser 0.10.4 requires the authentication-only `Driver.login()` contract from
+`hbrowser>=0.46.1,<0.47` with Zendriver 0.17.1. The transport removes
 completed event records itself; account and driver ownership, navigation,
 authentication, and HentaiVerse workflows remain available.
+
+HBrowser 0.46 mutually authenticates child log forwarding before sending records.
+Upgrade and restart the parent and all owned children together; the old wire
+protocol is rejected. Existing JSONL logs remain usable without conversion.
+Version 0.46.1 is required so a completed, failed browser-close attempt can be
+retried with a new caller deadline without extending an unresolved attempt.
 
 Build a clean environment backed by the PyPI release of `hbrowser`:
 
@@ -194,7 +200,7 @@ dependency resolution:
 
 ```bash
 uv pip install --python .venv/bin/python --reinstall -e '.[dev]' \
-  /path/to/hbrowser-0.45.0-py3-none-any.whl
+  /path/to/hbrowser-0.46.1-py3-none-any.whl
 ```
 
 Commands that must preserve this candidate use `uv run --no-sync`.

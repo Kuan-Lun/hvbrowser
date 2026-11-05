@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "hvbrowser"
-version = "0.10.3"
+version = "0.10.4"
 description = "Browser automation APIs for HentaiVerse."
 readme = "README.md"
 authors = [{ name = "Kuan-Lun Wang" }]
@@ -12,7 +12,7 @@ license = "GPL-3.0-only"
 license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = [
-    "hbrowser>=0.45.0,<0.46",
+    "hbrowser>=0.46.1,<0.47",
     # hvbrowser imports zendriver.cdp directly; keep this exact runtime cohort
     # aligned with hbrowser's verified Zendriver constraint.
     "zendriver==0.17.1",

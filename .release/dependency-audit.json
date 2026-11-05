@@ -1,21 +1,21 @@
 {
-  "checked_at": "2026-10-12T05:15:54+00:00",
-  "manifest_sha256": "d93e594bb47d6a16368a68ed45ecbf9cd58a5c271654fa52636ae87dcc39bc85",
+  "checked_at": "2026-11-05T22:27:45+00:00",
+  "manifest_sha256": "e62ddd5503ba83c497bd698879f9adb1418e1859aa52fc64bb8268ff12b06970",
   "node": [
     {
       "declared": ">=0.18.1",
-      "latest": "0.23.3",
+      "latest": "0.24.0",
       "latest_satisfies": true,
       "name": "markdownlint-cli2",
       "registry_url": "https://www.npmjs.com/package/markdownlint-cli2"
     }
   ],
-  "project_version": "0.10.3",
+  "project_version": "0.10.4",
   "python": [
     {
       "declared": "hatchling>=1.32.0",
       "group": "build",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -24,9 +24,9 @@
       "url": "https://pypi.org/project/hatchling/"
     },
     {
-      "declared": "hbrowser>=0.45.0,<0.46",
+      "declared": "hbrowser>=0.46.1,<0.47",
       "group": "runtime",
-      "latest": "0.44.2",
+      "latest": "0.46.0",
       "latest_satisfies": false,
       "name": "hbrowser",
       "python_3_14": true,
@@ -59,7 +59,7 @@
     {
       "declared": "hatchling>=1.32.0",
       "group": "optional:dev",
-      "latest": "1.32.4",
+      "latest": "1.33.0",
       "latest_satisfies": true,
       "name": "hatchling",
       "python_3_14": true,
@@ -70,7 +70,7 @@
     {
       "declared": "mypy>=2.3.1",
       "group": "optional:dev",
-      "latest": "2.4.0",
+      "latest": "2.4.1",
       "latest_satisfies": true,
       "name": "mypy",
       "python_3_14": true,
@@ -92,7 +92,7 @@
     {
       "declared": "pytest>=9.1.1",
       "group": "optional:dev",
-      "latest": "9.1.1",
+      "latest": "9.2.0",
       "latest_satisfies": true,
       "name": "pytest",
       "python_3_14": true,
@@ -103,7 +103,7 @@
     {
       "declared": "ruff>=0.16.4",
       "group": "optional:dev",
-      "latest": "0.17.0",
+      "latest": "0.17.4",
       "latest_satisfies": true,
       "name": "ruff",
       "python_3_14": true,
@@ -113,7 +113,7 @@
     }
   ],
   "review": {
-    "note": "Validated hbrowser 0.45.0 candidate wheel a1c70c3492d4a61f5d12244f9f5da5de05816b55f98209d75880490eb3b1b3c6 with exact Zendriver 0.17.1. Reviewed upstream Zendriver 0.17.0 event memory, flat CDP session and connection shutdown changes and 0.17.1 timeout fix; real transport regression evidence lives in hbrowser. Normal resolution installed 36 packages on CPython 3.14.8; offline suite passed 218 tests plus 136 subtests. Reviewed current Hatchling, build, mypy, packaging and Ruff release notes and validated strict fast gate without global relaxations. No HVBrowser public API or persisted data format is removed.",
+    "note": "2026-11-06 dependency-manifest refresh for hvbrowser 0.10.4; preserve the task's single existing version bump. Raise only the hbrowser lower bound to 0.46.1, retaining the 0.47 upper compatibility boundary and all other declared constraints. The accepted hbrowser 0.46.0 wheel exposed three existing HVBrowser close-retry failures: an already terminal cancelled/failed inner closer retained its expired generation deadline. The planned 0.46.1 repair must allow a new explicit caller to retry while retaining the old deadline for pending or late-successful cleanup. This requirement is not a claim that the repair or its final wheel has passed acceptance.\n\nThe previous audit SHA256 94630167ab9f6bd810113506fd94afb90d9db4940b38449fc6d7964e370a62f0 remains the attributed review of unchanged direct versions and their upstream release notes. Fresh official PyPI/npm metadata still reports the same external releases except Ruff 0.17.4. Newly read https://github.com/astral-sh/ruff/releases/tag/0.17.4 (2026-11-05): fixes semicolon parsing and BOM diagnostics, adjusts SIM102/preview G004, improves repeated-dictionary-key and formatter performance, honors NO_COLOR/CLICOLOR and strengthens __debug__ assignment syntax checks. Existing >=0.16.4 admits this release; explicit py314 and selected rules remain appropriate. No new excluded external stable release or demonstrated incompatibility calls for changing other bounds. Declared Python metadata admits 3.14; absent Requires-Python, such as distlib, is only metadata admission, not execution proof. markdownlint-cli2 0.24.0 requires Node>=22.\n\nPublished hbrowser is currently 0.46.0, below the deliberately required minimum. Wait for the accepted 0.46.1 wheel with exact metadata/payload proof and normal dependency resolution; do not substitute old 0.46.0 or fake metadata. Published Core 0.45.9, HVBrowser 0.10.2 and HVBattle 0.15.1 also remain below this integration batch's respective candidate requirements where declared. Their applicable explicit final artifacts and acceptance remain separate prerequisites. No registry-only readiness, new installation, suite pass or final compatibility result is claimed by this metadata refresh. Parent and owned children still upgrade/restart together; existing JSONL logs remain usable. Consumer runtime/tests, public APIs and data formats are unchanged; original failure oracles remain intact. Existing exact-candidate review/full gates and affected final dependency verification remain required before delivery. Retain directly imported Zendriver==0.17.1, the same declared lifecycle cohort as hbrowser.",
     "status": "reviewed"
   },
   "schema": "h2h.dependency-audit.v1"
